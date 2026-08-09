@@ -12,7 +12,7 @@
 
 | ルート | SSMパラメータ | 対象 |
 | --- | --- | --- |
-| `dev` | `/p2pquake-notify/discord/dev-webhook-url` | 全メッセージ。訓練報もピア分布 (code 555) も未対応のcodeも流します。 |
+| `dev` | `/p2pquake-notify/discord/dev-webhook-url` | ピア分布 (code 555) を除く全メッセージ。訓練報も揺れた報告も未対応のcodeも流します。 |
 | `alert` | `/p2pquake-notify/discord/alert-webhook-url` | 緊急地震速報 (556) と津波予報 (552)。全国。 |
 | `local` | `/p2pquake-notify/discord/local-webhook-url` | `P2PQUAKE_LOCAL_PREFECTURES` (既定は岩手県) に関わる地震情報 (551)・津波予報 (552)・緊急地震速報 (556)。 |
 
@@ -21,6 +21,8 @@
 `local` に code 554 (揺れ検知) を入れていないのは、554が地域情報を持たず、地域フィルタと併用すると決して一致しないためです。
 
 **訓練報・テスト配信 (`test: true`) は `dev` 以外には流しません。** 訓練のたびに本番の通知先へ誤報が飛ぶと、いざという時に誰も信じなくなります。
+
+**ピア分布 (code 555) はどのルートへも流しません。** 人間が読んで意味のある情報を含まないうえ、地震が無くても一定間隔で届き続けるので、`dev` に流すだけでも他の通知を押し流します。このcodeの用途は「上流と繋がっている」ことの証明だけで、それは `p2pquake_last_message_age_seconds` として Grafana に出ています。
 
 ## 環境変数
 

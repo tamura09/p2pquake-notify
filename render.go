@@ -27,7 +27,7 @@ const (
 	colorSevere   = 0xF76707 // 震度5弱以上
 	colorModerate = 0xF59F00 // 震度3〜4
 	colorInfo     = 0x4C6EF5 // 震度1〜2、その他の地震情報
-	colorMuted    = 0x868E96 // 雑音扱いのもの(ピア分布など)
+	colorMuted    = 0x868E96 // 地震の発生とは限らないもの、未対応のcode
 )
 
 type discordWebhookPayload struct {
@@ -78,8 +78,6 @@ func renderPayload(e *event, zone *time.Location) discordWebhookPayload {
 		return renderQuake(payload, zone)
 	case eewDetection:
 		return renderEEWDetection(payload)
-	case areaPeers:
-		return renderAreaPeers(payload)
 	default:
 		return renderUnknown(e)
 	}
@@ -378,21 +376,8 @@ func renderEEWDetection(message eewDetection) discordWebhookPayload {
 	}
 }
 
-func renderAreaPeers(message areaPeers) discordWebhookPayload {
-	total := 0
-	for _, area := range message.Areas {
-		total += area.Peer
-	}
-	return discordWebhookPayload{
-		Embeds: []discordEmbed{{
-			Title:       "ピア分布",
-			Description: fmt.Sprintf("%d地域 / 合計%dピア", len(message.Areas), total),
-			Color:       colorMuted,
-			Footer:      &discordEmbedFooter{Text: "P2P地震情報 (code 555)"},
-		}},
-		AllowedMentions: noMentions(),
-	}
-}
+// ピア分布(code 555)に描画はありません。どのルートへも流さないためです
+// (理由は route.matches を参照)。
 
 // renderUnknown は知らない code のための最後の砦。dev用ルートにだけ流れます。
 // 上流がメッセージ形式を増やしたとき、ここに出てくることで気付けます。

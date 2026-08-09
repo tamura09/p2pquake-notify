@@ -28,19 +28,29 @@ type route struct {
 	// 訓練報を本番の通知先に流すと、いざという時に誰も信じなくなります。
 	IncludeTest bool
 
-	// Quiet は「接続確認用の雑音」(ピア分布・揺れた報告)を通すか。
-	// dev用ルートだけ true にして、上流が生きていることを目視できるようにします。
+	// Quiet は「地震そのものではない報せ」(揺れた報告とその統計)を通すか。
+	// dev用ルートだけ true にします。
 	Quiet bool
 }
 
-// noisyCodes は地震と無関係に流れ続ける code。既定では通知しません。
+// noisyCodes は地震の発生とは限らない code。既定では通知しません。
 var noisyCodes = map[int]struct{}{
-	codeAreaPeers:           {},
 	codeUserquake:           {},
 	codeUserquakeEvaluation: {},
 }
 
 func (r route) matches(e *event) bool {
+	// ピア分布はどのルートへも流しません。人間が読んで意味のある情報を何も
+	// 含まず、地震が無くても一定間隔で届き続けるので、通知に混ぜると
+	// 他の通知を押し流すだけです。
+	//
+	// このcodeの用途は「上流と繋がっている」ことの証明だけで、それは
+	// p2pquake_last_message_age_seconds として Grafana へ押し込んでいます。
+	// 目視用にdevへ流す必要はありません。
+	if e.Code == codeAreaPeers {
+		return false
+	}
+
 	if e.Test && !r.IncludeTest {
 		return false
 	}
