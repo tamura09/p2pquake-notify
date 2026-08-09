@@ -27,35 +27,36 @@ type route struct {
 	// IncludeTest は訓練報・テスト配信を通すか。dev以外では必ず false です。
 	// 訓練報を本番の通知先に流すと、いざという時に誰も信じなくなります。
 	IncludeTest bool
-
-	// Quiet は「地震そのものではない報せ」(揺れた報告とその統計)を通すか。
-	// dev用ルートだけ true にします。
-	Quiet bool
 }
 
-// noisyCodes は地震の発生とは限らない code。既定では通知しません。
-var noisyCodes = map[int]struct{}{
+// neverNotified はどのルートへも流さない code。
+//
+// いずれもP2P地震情報のネットワーク内部の様子であって、気象庁の発表ではありません。
+// 3つとも「1件が来る」ではなく「秒単位で来続ける」性質を持っていて、通知に混ぜると
+// 本当に読みたい地震情報を押し流します。
+//
+//   - 555 ピア分布: 地域ごとの接続台数。地震の有無に関係なく一定間隔で届きます。
+//     用途は「上流と繋がっている」ことの証明だけで、それは
+//     p2pquake_last_message_age_seconds として Grafana に出ています。
+//   - 561 揺れた報告: 利用者1人が「揺れた」と押した、という1点の記録。単体では
+//     何も意味せず、少し揺れただけで数十件が数秒のうちに流れます。
+//   - 9611 揺れた報告の統計: 561を集計した推定値。1回の地震のあいだ中、
+//     数値が更新されるたびに新しいメッセージとして届き続けます。
+//
+// 561と9611に描画を用意していないのもこのためです。通知しないと決めたものに
+// 見た目を与える理由がありません。
+var neverNotified = map[int]struct{}{
+	codeAreaPeers:           {},
 	codeUserquake:           {},
 	codeUserquakeEvaluation: {},
 }
 
 func (r route) matches(e *event) bool {
-	// ピア分布はどのルートへも流しません。人間が読んで意味のある情報を何も
-	// 含まず、地震が無くても一定間隔で届き続けるので、通知に混ぜると
-	// 他の通知を押し流すだけです。
-	//
-	// このcodeの用途は「上流と繋がっている」ことの証明だけで、それは
-	// p2pquake_last_message_age_seconds として Grafana へ押し込んでいます。
-	// 目視用にdevへ流す必要はありません。
-	if e.Code == codeAreaPeers {
+	if _, blocked := neverNotified[e.Code]; blocked {
 		return false
 	}
 
 	if e.Test && !r.IncludeTest {
-		return false
-	}
-
-	if _, noisy := noisyCodes[e.Code]; noisy && !r.Quiet {
 		return false
 	}
 
@@ -118,9 +119,6 @@ func (r route) String() string {
 	}
 	if r.IncludeTest {
 		parts = append(parts, "includeTest=true")
-	}
-	if r.Quiet {
-		parts = append(parts, "quiet=true")
 	}
 	return strings.Join(parts, " ")
 }

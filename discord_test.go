@@ -59,7 +59,7 @@ func (s *recordingServer) recorded() []recordedRequest {
 func testSink(t *testing.T, webhookURL string) *sink {
 	t.Helper()
 	zone := time.FixedZone("JST", 9*60*60)
-	return newSink(route{Name: "test", WebhookURL: webhookURL, MinScale: scaleUnknown, IncludeTest: true, Quiet: true},
+	return newSink(route{Name: "test", WebhookURL: webhookURL, MinScale: scaleUnknown, IncludeTest: true},
 		&http.Client{Timeout: 5 * time.Second}, zone)
 }
 
