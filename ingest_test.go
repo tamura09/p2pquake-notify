@@ -191,17 +191,19 @@ func TestDispatchDropsDuplicates(t *testing.T) {
 	}
 }
 
-// ピア分布は接続が生きている印として繰り返し届くので、重複排除の枠を
-// 食い潰さないよう鍵を覚えません。毎回dev用ルートへ流れる必要があります。
-func TestAreaPeersIsNotDeduplicated(t *testing.T) {
+// ピア分布は通知しませんが、受信そのものは接続が生きている印です。
+// 重複排除の枠を食い潰さないよう鍵は覚えず、かつどのルートへも流しません。
+func TestAreaPeersIsNeverNotifiedAndNeverDeduplicated(t *testing.T) {
 	receiver, s, _ := testIngest(t, "[]")
 
 	receiver.handle([]byte(areaPeersMessage))
 	receiver.handle([]byte(areaPeersMessage))
 
-	if got := len(s.queue); got != 2 {
-		t.Errorf("queued %d peer messages, want 2", got)
+	if got := len(s.queue); got != 0 {
+		t.Errorf("queued %d peer messages, want 0 (they carry nothing a human can read)", got)
 	}
+	// 鍵を覚えてしまうと、絶え間なく届くピア分布で重複排除のキャッシュが
+	// 埋まり、本来まとめたい地震の再配信を取りこぼします。
 	if receiver.dedup.len() != 0 {
 		t.Errorf("dedup cache holds %d entries, want 0", receiver.dedup.len())
 	}

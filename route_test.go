@@ -55,10 +55,12 @@ func TestRoutingMatrix(t *testing.T) {
 			wantDev: true, wantAlert: false, wantLocal: false,
 		},
 		{
-			// ピア分布は接続確認用の雑音。dev だけが受け取ります。
+			// ピア分布はどのルートへも流しません。人間が読んで意味のある情報を
+			// 何も含まないうえ、地震が無くても届き続けるので、devに流すだけでも
+			// 他の通知を押し流します。生存確認はメトリクス側の仕事です。
 			name:    "area peers",
 			raw:     areaPeersMessage,
-			wantDev: true, wantAlert: false, wantLocal: false,
+			wantDev: false, wantAlert: false, wantLocal: false,
 		},
 	}
 

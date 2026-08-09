@@ -79,6 +79,8 @@ func loadConfig(ctx context.Context, resolver parameterResolver) (config, error)
 			name: "dev",
 			env:  "P2PQUAKE_DEV_WEBHOOK_PARAMETER_NAME",
 			build: func(webhook string) route {
+				// 訓練報と揺れた報告まで含めた全件。ただしピア分布(555)だけは
+				// ここにも流れません(route.matches を参照)。
 				return route{
 					Name:        "dev",
 					WebhookURL:  webhook,
