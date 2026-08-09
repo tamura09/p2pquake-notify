@@ -33,7 +33,7 @@
 | `P2PQUAKE_LOCAL_MIN_SCALE` | `-1` (しきい値なし) | 地域ルートの最小震度。`30`=震度3、`45`=震度5弱 |
 | `P2PQUAKE_WS_URL` | `wss://api.p2pquake.net/v2/ws` | 接続先。サンドボックスへの切り替えに使います |
 | `P2PQUAKE_HISTORY_URL` | `https://api.p2pquake.net/v2/history` | 再接続時のギャップ補完に読むREST |
-| `P2PQUAKE_BACKFILL_LIMIT` | `20` | 補完で読み直す件数。`0`で補完しない |
+| `P2PQUAKE_BACKFILL_LIMIT` | `20` | 補完で読み直す件数（**code 1つあたり**）。`0`で補完しない |
 | `P2PQUAKE_STALE_AFTER` | `10m` | この時間まったく受信が無ければ接続が死んだとみなす |
 | `GRAFANA_REMOTE_WRITE_URL_PARAMETER_NAME` | (なし) | 未設定ならハートビート送信を無効にします |
 | `GRAFANA_PROMETHEUS_USERNAME_PARAMETER_NAME` | (なし) | Grafana CloudのPrometheus username (instance ID) |
@@ -85,4 +85,6 @@ go test ./...
 - P2P地震情報は無保証の無償サービスです。可用性の保証はありません。
 - `code: 556` は気象庁の緊急地震速報 (**警報**) のみで、震度4以下相当の「予報」は流れてきません。予報レベルまで必要なら [DM-D.S.S (dmdata.jp)](https://dmdata.jp/) のような有償の配信を併用することになります。
 - `code: 554` はP2P地震情報のクライアントが揺れを検知したという意味で、気象庁の発表ではありません。誤検知があります。通知本文にも毎回その旨を書いています。
+- **`/v2/history` は1リクエストにつき1つの `codes` しか受け付けません。** `codes=551,552,556` は400で、`codes=551&codes=552` は最初の1つだけが効きます。そのため履歴補完は code ごとにリクエストを分けています。
+- **`codes` を指定せずに `/v2/history` を叩いてはいけません。** ピア分布 (code 555) が絶えず記録されているので `limit` の枠が丸ごとそれで埋まり、地震も津波も1件も返ってきません。補完は成功したように見えて常に空振りします。
 - 型定義は [types.go](types.go) にありますが、必須として扱っているのは `code` だけです。上流がフィールドを増減しても落ちないよう、他はすべて「無ければゼロ値」で成立するようにしています。未対応のcodeは生JSONのまま `dev` ルートへ流れるので、そこで形式変更に気付けます。

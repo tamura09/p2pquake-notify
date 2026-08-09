@@ -91,10 +91,11 @@ func main() {
 	}
 
 	receiver := &ingest{
-		cfg:    cfg,
-		client: newWebSocketClient(),
-		dedup:  newDedupCache(dedupTTL, dedupMaxSize),
-		sinks:  sinks,
+		cfg:       cfg,
+		wsClient:  newWebSocketClient(),
+		apiClient: apiClient,
+		dedup:     newDedupCache(dedupTTL, dedupMaxSize),
+		sinks:     sinks,
 	}
 
 	var wg sync.WaitGroup
@@ -148,10 +149,25 @@ func newAPIClient() *http.Client {
 //     効くので、張りっぱなしにしたい接続がその時間で必ず切られます。
 //   - HTTP/2 を無効にします。WebSocketのハンドシェイクは HTTP/1.1 の Upgrade で、
 //     ALPN で h2 が選ばれると成立しません。
+//
+// このクライアントを普通のHTTPリクエストに使い回してはいけません。HTTP/1.1に
+// 固定されているので、HTTP/2で応えるサーバ(上流の /v2/history がそうです)に投げると
+// SETTINGSフレームを壊れたHTTP/1応答として読んで必ず失敗します。RESTには
+// newAPIClient のほうを使ってください。
 func newWebSocketClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	// HTTP/1.1 だけを名乗らせます。Go 1.24以降は Protocols フィールドが
+	// ForceAttemptHTTP2 と TLSNextProto より優先されるので、古い2つを
+	// 設定するだけでは DefaultTransport から引き継いだ設定に負けて
+	// ALPN が h2 を提示したままになります。
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	transport.Protocols = protocols
+
 	transport.ForceAttemptHTTP2 = false
 	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+
 	return &http.Client{Transport: transport}
 }
 
