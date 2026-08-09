@@ -9,7 +9,7 @@ import (
 // テスト用に本番と同じ3本を組み立てます。loadConfig は SSM を触るので、
 // ルーティングの検証だけはここで直接作ります。
 func testRoutes() (dev, alert, local route) {
-	dev = route{Name: "dev", MinScale: scaleUnknown, IncludeTest: true, Quiet: true}
+	dev = route{Name: "dev", MinScale: scaleUnknown, IncludeTest: true}
 	alert = route{Name: "alert", Codes: codeSet(codeEEW, codeJMATsunami), MinScale: scaleUnknown}
 	local = route{
 		Name:        "local",
@@ -60,6 +60,20 @@ func TestRoutingMatrix(t *testing.T) {
 			// 他の通知を押し流します。生存確認はメトリクス側の仕事です。
 			name:    "area peers",
 			raw:     areaPeersMessage,
+			wantDev: false, wantAlert: false, wantLocal: false,
+		},
+		{
+			// 揺れた報告は利用者1人が「揺れた」と押した1点の記録です。単体では
+			// 何も意味せず、少し揺れただけで数十件が数秒のうちに流れます。
+			name:    "userquake report",
+			raw:     userquakeMessage,
+			wantDev: false, wantAlert: false, wantLocal: false,
+		},
+		{
+			// その集計は1回の地震のあいだ中、数値が更新されるたびに新しい
+			// メッセージとして届き続けます。
+			name:    "userquake evaluation",
+			raw:     userquakeEvaluationMessage,
 			wantDev: false, wantAlert: false, wantLocal: false,
 		},
 	}

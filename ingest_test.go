@@ -191,8 +191,21 @@ func TestDispatchDropsDuplicates(t *testing.T) {
 	}
 }
 
+// P2Pネットワーク内部の様子を伝えるだけのcodeは、受信はしても通知しません。
+// 実際にこれが本番のdevチャンネルを埋め尽くしました。
+func TestInternalNetworkCodesAreNeverNotified(t *testing.T) {
+	receiver, s, _ := testIngest(t, "[]")
+
+	for _, raw := range []string{userquakeMessage, userquakeEvaluationMessage, areaPeersMessage} {
+		receiver.handle([]byte(raw))
+	}
+	if got := len(s.queue); got != 0 {
+		t.Errorf("queued %d internal messages, want 0", got)
+	}
+}
+
 // ピア分布は通知しませんが、受信そのものは接続が生きている印です。
-// 重複排除の枠を食い潰さないよう鍵は覚えず、かつどのルートへも流しません。
+// 重複排除の枠を食い潰さないよう鍵は覚えません。
 func TestAreaPeersIsNeverNotifiedAndNeverDeduplicated(t *testing.T) {
 	receiver, s, _ := testIngest(t, "[]")
 
