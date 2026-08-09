@@ -7,8 +7,66 @@ import (
 	"testing"
 	"time"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/coder/websocket"
 )
+
+// 実際のDiscordチャンネルへ1通だけ送ります。地震を待たずに埋め込みの見た目を
+// 確認するためのもので、ネットワークにもAWSにも出るので既定では走らせません。
+//
+//	AWS_REGION=ap-northeast-1 P2PQUAKE_SEND_TEST_NOTIFICATION=1 go test -run TestLiveSendOne -v ./...
+//
+// 送るのは訓練報です。本物と見分けのつかない緊急地震速報をチャンネルに置くと、
+// 後から見た人が実際の警報と取り違えます。訓練報なら題名に【訓練】が付き、
+// スマホを鳴らす本文も付かないうえ、地域ごとの予想震度をまとめる一番複雑な
+// 描画経路をそのまま通ります。
+func TestLiveSendOneNotificationToDev(t *testing.T) {
+	if os.Getenv("P2PQUAKE_SEND_TEST_NOTIFICATION") == "" {
+		t.Skip("set P2PQUAKE_SEND_TEST_NOTIFICATION=1 to post one message to the dev channel")
+	}
+
+	ctx := context.Background()
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		t.Fatalf("load AWS config: %v", err)
+	}
+	application := &app{parameters: ssm.NewFromConfig(cfg)}
+
+	parameterName := envOr("P2PQUAKE_DEV_WEBHOOK_PARAMETER_NAME", "/p2pquake-notify/discord/dev-webhook-url")
+	value, err := application.parameterString(ctx, parameterName)
+	if err != nil {
+		t.Fatalf("read %s: %v", parameterName, err)
+	}
+	webhook, err := validateWebhookURL(value)
+	if err != nil {
+		t.Fatalf("%s: %v", parameterName, err)
+	}
+
+	s := newSink(route{
+		Name:        "manual",
+		WebhookURL:  webhook,
+		MinScale:    scaleUnknown,
+		IncludeTest: true,
+	}, newAPIClient(), testZone())
+
+	e := decodeOrFail(t, eewTraining)
+	payload := renderPayload(e, testZone())
+	t.Logf("sending: %s", payload.Embeds[0].Title)
+
+	before := notifyFailures.Load()
+	sent := notifySent.Load()
+
+	s.deliver(ctx, e)
+
+	if notifyFailures.Load() != before {
+		t.Fatal("Discord rejected the message; see the log line above for the status code")
+	}
+	if notifySent.Load() != sent+1 {
+		t.Fatalf("expected exactly one message to be sent, counter went %d -> %d", sent, notifySent.Load())
+	}
+	t.Log("delivered 1 message to the dev channel")
+}
 
 // 上流のサンドボックスに実際に接続し、届いたメッセージがこのリポジトリの型で
 // 読めることを確認します。ネットワークに出るので既定では走らせません。
