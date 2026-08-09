@@ -72,3 +72,39 @@ func TestLiveSandboxMessagesDecode(t *testing.T) {
 	}
 	t.Logf("messages by code: %v", seen)
 }
+
+// 履歴補完を本番の /v2/history に対して実行します。
+//
+// これは実際に本番で起きた壊れ方への回帰テストです。履歴の取得にWebSocket用の
+// クライアント(HTTP/1.1固定)を使い回していたため、HTTP/2で応える上流に対して
+// "malformed HTTP response \x00\x00\x12\x04..." で毎回失敗していました。
+// 補完の失敗はログを出して続行する設計なので、通知は正常に動いたまま
+// 再接続時のギャップ埋めだけが黙って死んでいる状態になります。
+// httptest はHTTP/1.1で応えるので、ローカルのテストではこの差が出ません。
+func TestLiveHistoryBackfill(t *testing.T) {
+	if os.Getenv("P2PQUAKE_LIVE_TEST") == "" {
+		t.Skip("set P2PQUAKE_LIVE_TEST=1 to run against the upstream")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	receiver := &ingest{
+		cfg: config{
+			HistoryURL:    defaultHistoryURL,
+			BackfillLimit: 10,
+			Zone:          testZone(),
+		},
+		apiClient: newAPIClient(),
+		dedup:     newDedupCache(time.Hour, 100),
+	}
+
+	// notify=false なので通知はせず、鍵の登録だけを行います。
+	if err := receiver.backfill(ctx, false); err != nil {
+		t.Fatalf("backfill against %s: %v", defaultHistoryURL, err)
+	}
+	if receiver.dedup.len() == 0 {
+		t.Error("history returned nothing; the gap-filling on reconnect would be a no-op")
+	}
+	t.Logf("primed %d events from history", receiver.dedup.len())
+}

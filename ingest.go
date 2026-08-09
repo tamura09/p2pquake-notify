@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -28,10 +29,20 @@ const (
 
 // ingest はWebSocket接続を維持し、届いたメッセージをルートへ配ります。
 type ingest struct {
-	cfg    config
-	client *http.Client
-	dedup  *dedupCache
-	sinks  []*sink
+	cfg config
+
+	// wsClient はWebSocketのハンドシェイク専用(HTTP/1.1固定・タイムアウト無し)、
+	// apiClient は履歴を読むREST用です。1つで兼ねてはいけません。
+	// 兼ねていた時は、HTTP/1.1に固定したクライアントで https://api.p2pquake.net/v2/history
+	// を叩き、ALPNでHTTP/2を選んだサーバの応答をHTTP/1のフレームとして読もうとして
+	// "malformed HTTP response \x00\x00\x12\x04..." (HTTP/2のSETTINGSフレーム) で
+	// 毎回失敗していました。補完の失敗はログを出して続行する作りなので、
+	// 通知は動いているのに再接続時のギャップ埋めだけが黙って死んでいる状態になります。
+	wsClient  *http.Client
+	apiClient *http.Client
+
+	dedup *dedupCache
+	sinks []*sink
 }
 
 // run は接続が切れても諦めずに繋ぎ直し続けます。ctx がキャンセルされるまで戻りません。
@@ -84,7 +95,7 @@ func (i *ingest) connectAndRead(ctx context.Context) error {
 	defer cancel()
 
 	conn, _, err := websocket.Dial(dialCtx, i.cfg.WebSocketURL, &websocket.DialOptions{
-		HTTPClient: i.client,
+		HTTPClient: i.wsClient,
 	})
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -162,74 +173,131 @@ func (i *ingest) dispatch(e *event) {
 	}
 }
 
+// backfillCodes は履歴から拾い直す code。
+//
+// code を指定せずに /v2/history を叩いてはいけません。ピア分布(555)が絶えず
+// 記録されているため、limit の枠が丸ごとそれで埋まり、地震も津波も1件も
+// 返ってきません。補完は成功したように見えて常に空振りします。
+//
+// 554(揺れ検知)を入れていないのは、あれが「今まさに揺れているかもしれない」と
+// いう瞬間的な報せで、後から読み直しても価値が無いためです。
+var backfillCodes = []int{codeJMAQuake, codeJMATsunami, codeEEW}
+
 // backfill は /v2/history を読んで、切断中に発生したイベントを拾います。
 //
 // notify が false なら通知せず鍵だけを登録します(起動直後用)。true なら
-// 未見のイベントを通常どおり配ります。履歴は新しい順に返るので、通知の
-// 順序が自然になるよう古い順に並べ替えてから流します。
+// 未見のイベントを通常どおり配ります。
+//
+// code ごとに1リクエストするのは、上流が1リクエストにつき1つの code しか
+// 受け付けないためです("codes=551,552,556" は400、"codes=551&codes=552" は
+// 最初の1つだけが効きます)。集めた結果は発生時刻の古い順に並べ直してから
+// 流すので、通知の順序は実際に起きた順になります。
 func (i *ingest) backfill(ctx context.Context, notify bool) error {
 	if i.cfg.BackfillLimit <= 0 {
 		return nil
 	}
 
-	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-
-	endpoint, err := url.Parse(i.cfg.HistoryURL)
-	if err != nil {
-		return fmt.Errorf("parse history URL: %w", err)
-	}
-	query := endpoint.Query()
-	query.Set("limit", strconv.Itoa(i.cfg.BackfillLimit))
-	endpoint.RawQuery = query.Encode()
-
-	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return err
+	type timedEvent struct {
+		at time.Time
+		e  *event
 	}
 
-	resp, err := i.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	collected := make([]timedEvent, 0, len(backfillCodes)*i.cfg.BackfillLimit)
+	var failures []error
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return statusError{code: resp.StatusCode, body: string(body)}
-	}
-
-	var messages []json.RawMessage
-	if err := json.Unmarshal(body, &messages); err != nil {
-		return fmt.Errorf("decode history: %w", err)
-	}
-
-	for index := len(messages) - 1; index >= 0; index-- {
-		e, err := decodeEvent(messages[index])
-		if err != nil || e == nil {
+	for _, code := range backfillCodes {
+		messages, err := i.fetchHistory(ctx, code)
+		if err != nil {
+			// 1つの code が読めなくても他は拾います。全滅した時だけ
+			// 呼び出し側にエラーを返します。
+			failures = append(failures, fmt.Errorf("code %d: %w", code, err))
 			continue
 		}
-		// 履歴に必ず含まれるピア分布は、切断中に起きた「出来事」ではないので
-		// 補完の対象にしません。
-		if e.Code == codeAreaPeers {
-			continue
+
+		for _, raw := range messages {
+			e, err := decodeEvent(raw)
+			if err != nil || e == nil {
+				continue
+			}
+			at, _ := parseP2PTime(eventTime(raw), i.cfg.Zone)
+			collected = append(collected, timedEvent{at: at, e: e})
 		}
-		if i.dedup.seen(e.DedupKey) {
+	}
+
+	if len(failures) == len(backfillCodes) {
+		return errors.Join(failures...)
+	}
+	for _, err := range failures {
+		log.Printf("backfill partially failed (continuing): %v", err)
+	}
+
+	slices.SortStableFunc(collected, func(a, b timedEvent) int {
+		return a.at.Compare(b.at)
+	})
+
+	for _, item := range collected {
+		if i.dedup.seen(item.e.DedupKey) {
 			continue
 		}
 		if !notify {
 			continue
 		}
-		log.Printf("backfilled event code=%d from history", e.Code)
+		log.Printf("backfilled event code=%d from history", item.e.Code)
 		backfilledEvents.Add(1)
 		for _, s := range i.sinks {
-			if s.route.matches(e) {
-				s.offer(e)
+			if s.route.matches(item.e) {
+				s.offer(item.e)
 			}
 		}
 	}
 	return nil
+}
+
+// eventTime は並べ替えのために envelope の time だけを取り出します。
+// 読めなければゼロ値になり、その項目は先頭に寄ります。
+func eventTime(raw json.RawMessage) string {
+	var head envelope
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return ""
+	}
+	return head.Time
+}
+
+func (i *ingest) fetchHistory(ctx context.Context, code int) ([]json.RawMessage, error) {
+	requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	endpoint, err := url.Parse(i.cfg.HistoryURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse history URL: %w", err)
+	}
+	query := endpoint.Query()
+	query.Set("codes", strconv.Itoa(code))
+	query.Set("limit", strconv.Itoa(i.cfg.BackfillLimit))
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := i.apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, statusError{code: resp.StatusCode, body: string(body)}
+	}
+
+	var messages []json.RawMessage
+	if err := json.Unmarshal(body, &messages); err != nil {
+		return nil, fmt.Errorf("decode history: %w", err)
+	}
+	return messages, nil
 }
