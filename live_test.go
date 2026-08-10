@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +69,112 @@ func TestLiveSendOneNotificationToDev(t *testing.T) {
 		t.Fatalf("expected exactly one message to be sent, counter went %d -> %d", sent, notifySent.Load())
 	}
 	t.Log("delivered 1 message to the dev channel")
+}
+
+// 続報がDiscord上で本当に第1報のメッセージを書き換えているかを、投稿した
+// メッセージを読み戻して確かめます。
+//
+//	AWS_REGION=ap-northeast-1 P2PQUAKE_SEND_TEST_NOTIFICATION=1 go test -run TestLiveFollowUp -v ./...
+//
+// ローカルのテストは自前のHTTPサーバ相手にPATCHが飛んだことしか見ていません。
+// 実際にDiscordが書き換えを受け付けたかは、本物に投げて読み返すまで分かりません。
+func TestLiveFollowUpEditsTheMessageInDiscord(t *testing.T) {
+	if os.Getenv("P2PQUAKE_SEND_TEST_NOTIFICATION") == "" {
+		t.Skip("set P2PQUAKE_SEND_TEST_NOTIFICATION=1 to post to the dev channel")
+	}
+
+	ctx := context.Background()
+	webhook := devWebhookURL(ctx, t)
+	client := newAPIClient()
+	s := newSink(route{
+		Name:        "manual",
+		WebhookURL:  webhook,
+		MinScale:    scaleUnknown,
+		IncludeTest: true,
+	}, client, testZone())
+
+	first := decodeOrFail(t, eewTraining)
+	s.deliver(ctx, first)
+
+	posted, ok := s.messages[first.GroupKey]
+	if !ok || posted.id == "" {
+		t.Fatal("no message id was captured from the POST; a follow-up has nothing to edit")
+	}
+	t.Logf("posted message %s", posted.id)
+
+	second := decodeOrFail(t, eewTrainingSerial2)
+	if second.GroupKey != first.GroupKey {
+		t.Fatalf("GroupKey differs between serials (%q vs %q); they would never be joined",
+			first.GroupKey, second.GroupKey)
+	}
+	s.deliver(ctx, second)
+
+	after := s.messages[second.GroupKey]
+	if after.id != posted.id {
+		t.Errorf("follow-up used message %q, want the original %q (it posted a new message instead of editing)",
+			after.id, posted.id)
+	}
+
+	// Discordから読み戻します。ここが本題で、こちらがPATCHを投げたことでは
+	// なく、向こうが実際に書き換えたことを確かめます。
+	title := fetchWebhookMessageTitle(ctx, t, client, webhook, posted.id)
+	t.Logf("message now reads: %q", title)
+	if !strings.Contains(title, "第2報") {
+		t.Errorf("message %s still reads %q; the edit did not land", posted.id, title)
+	}
+}
+
+func devWebhookURL(ctx context.Context, t *testing.T) string {
+	t.Helper()
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		t.Fatalf("load AWS config: %v", err)
+	}
+	application := &app{parameters: ssm.NewFromConfig(cfg)}
+
+	parameterName := envOr("P2PQUAKE_DEV_WEBHOOK_PARAMETER_NAME", "/p2pquake-notify/discord/dev-webhook-url")
+	value, err := application.parameterString(ctx, parameterName)
+	if err != nil {
+		t.Fatalf("read %s: %v", parameterName, err)
+	}
+	webhook, err := validateWebhookURL(value)
+	if err != nil {
+		t.Fatalf("%s: %v", parameterName, err)
+	}
+	return webhook
+}
+
+func fetchWebhookMessageTitle(ctx context.Context, t *testing.T, client *http.Client, webhook, messageID string) string {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, webhook+"/messages/"+messageID, nil)
+	if err != nil {
+		t.Fatalf("build read-back request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("read back message: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		t.Fatalf("read back message: %d: %s", resp.StatusCode, truncate(string(body), 300))
+	}
+
+	var message struct {
+		Embeds []struct {
+			Title string `json:"title"`
+		} `json:"embeds"`
+	}
+	if err := json.Unmarshal(body, &message); err != nil {
+		t.Fatalf("decode read-back message: %v", err)
+	}
+	if len(message.Embeds) == 0 {
+		t.Fatal("read-back message has no embed")
+	}
+	return message.Embeds[0].Title
 }
 
 // 上流のサンドボックスに実際に接続し、届いたメッセージがこのリポジトリの型で
