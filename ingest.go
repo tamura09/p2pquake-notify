@@ -183,10 +183,33 @@ func (i *ingest) dispatch(e *event) {
 // いう瞬間的な報せで、後から読み直しても価値が無いためです。
 var backfillCodes = []int{codeJMAQuake, codeJMATsunami, codeEEW}
 
+// backfillHorizon は補完で通知してよい最大の遡り時間。
+//
+// これが無いと、2026年8月10日に起きたような事故になります。上流が接続を切り
+// (8時間ほどで一度EOFを返してきます)、再接続で補完が走り、7月28日の
+// 緊急地震速報と津波注意報がその朝の通知として一斉に届きました。
+//
+// 原因は履歴の limit が「件数」で効くことです。地震情報(551)なら20件は
+// 数時間ぶんですが、緊急地震速報(556)や津波予報(552)はめったに発表されないので
+// 20件が数週間前まで遡ります。重複排除の鍵は起動時に登録していましたが、
+// dedupTTL(2時間)を過ぎて消えていたため、どれも初見として扱われました。
+//
+// 鍵の寿命を延ばすだけでは足りません。長時間止まっていた後に起動すれば、
+// キャッシュが空の状態で同じことが起きます。「切断中に起きたと言える新しさか」
+// を時刻で直接判定するのが唯一確実な歯止めです。
+//
+// 30分なのは、それ以上前の緊急地震速報に行動の余地が無いからです。揺れは
+// とっくに終わっていて、記録としては後から出る地震情報(551)が残ります。
+// 通常の再接続は数秒で終わるので、本来拾いたいギャップはこれで十分覆えます。
+//
+// dedupTTL はこの値より必ず長く保ってください(TestDedupTTLOutlivesBackfillHorizon)。
+// 短いと、地平線の内側にあるイベントの鍵が先に消えて再通知されます。
+const backfillHorizon = 30 * time.Minute
+
 // backfill は /v2/history を読んで、切断中に発生したイベントを拾います。
 //
 // notify が false なら通知せず鍵だけを登録します(起動直後用)。true なら
-// 未見のイベントを通常どおり配ります。
+// 未見かつ backfillHorizon より新しいイベントを配ります。
 //
 // code ごとに1リクエストするのは、上流が1リクエストにつき1つの code しか
 // 受け付けないためです("codes=551,552,556" は400、"codes=551&codes=552" は
@@ -235,6 +258,12 @@ func (i *ingest) backfill(ctx context.Context, notify bool) error {
 		return a.at.Compare(b.at)
 	})
 
+	// 通知してよいのは「切断中に起きた」と言える新しさのものだけです。
+	// 履歴の limit は件数で効くので、緊急地震速報(556)や津波予報(552)のように
+	// めったに発表されないcodeでは20件が数週間前まで遡ります。
+	cutoff := time.Now().Add(-backfillHorizon)
+
+	notified, stale := 0, 0
 	for _, item := range collected {
 		if i.dedup.seen(item.e.DedupKey) {
 			continue
@@ -242,13 +271,26 @@ func (i *ingest) backfill(ctx context.Context, notify bool) error {
 		if !notify {
 			continue
 		}
-		log.Printf("backfilled event code=%d from history", item.e.Code)
+		// 時刻が読めなかったものも古い側に倒します。日付の分からない
+		// 緊急地震速報を送るより、送らないほうが確実に安全です。
+		if !item.at.After(cutoff) {
+			stale++
+			continue
+		}
+		notified++
 		backfilledEvents.Add(1)
 		for _, s := range i.sinks {
 			if s.route.matches(item.e) {
 				s.offer(item.e)
 			}
 		}
+	}
+
+	// 1件1行ではなく1回1行にします。件数の内訳が見えないと、大量の再送が
+	// 起きている時に「補完が動いている」ようにしか読めません。
+	if notify {
+		log.Printf("backfill: fetched=%d notified=%d skipped_as_stale=%d horizon=%s",
+			len(collected), notified, stale, backfillHorizon)
 	}
 	return nil
 }

@@ -13,6 +13,25 @@ import (
 	"time"
 )
 
+// quakeAt は指定時刻の地震情報(551)を1件組み立てます。補完が通知するかどうかは
+// イベントの新しさで決まるので、固定日付の文字列では試験になりません。
+func quakeAt(at time.Time) string {
+	stamp := at.In(testZone()).Format("2006/01/02 15:04:05.000")
+	issued := at.In(testZone()).Format("2006/01/02 15:04:05")
+	return fmt.Sprintf(`{
+		"code": 551,
+		"time": %q,
+		"earthquake": {
+			"time": %q,
+			"hypocenter": {"name": "東京湾", "depth": 40, "magnitude": 4.2},
+			"maxScale": 30,
+			"domesticTsunami": "None"
+		},
+		"issue": {"source": "気象庁", "time": %q, "type": "DetailScale", "correct": "None"},
+		"points": [{"pref": "東京都", "addr": "千代田区", "isArea": false, "scale": 30}]
+	}`, stamp, issued, issued)
+}
+
 // historyRequests は補完が上流へ投げたクエリの記録。
 type historyRequests struct {
 	mu    sync.Mutex
@@ -99,7 +118,7 @@ func TestStartupBackfillPrimesWithoutNotifying(t *testing.T) {
 
 // 再接続時の履歴読み込みは、切断中に起きたイベントを拾って通知します。
 func TestReconnectBackfillNotifiesUnseenEvents(t *testing.T) {
-	receiver, s, _ := testIngest(t, "["+quakeTokyo+"]")
+	receiver, s, _ := testIngest(t, "["+quakeAt(time.Now().Add(-2*time.Minute))+"]")
 
 	if err := receiver.backfill(context.Background(), true); err != nil {
 		t.Fatalf("backfill: %v", err)
@@ -114,6 +133,75 @@ func TestReconnectBackfillNotifiesUnseenEvents(t *testing.T) {
 	}
 	if got := len(s.queue); got != 1 {
 		t.Errorf("queue holds %d events after a repeat backfill, want 1", got)
+	}
+}
+
+// 2026年8月10日の事故への回帰テスト。
+//
+// 上流が8時間ほどで接続を切ってくるので再接続の補完が走り、7月28日の
+// 緊急地震速報と津波注意報が「今起きたこと」として一斉に届きました。履歴の
+// limit は件数で効くため、めったに発表されないcodeでは20件が数週間前まで遡ります。
+// 重複排除の鍵は起動時に登録済みでしたが、dedupTTLを過ぎて消えていました。
+func TestBackfillNeverNotifiesStaleEvents(t *testing.T) {
+	old := quakeAt(time.Now().Add(-14 * 24 * time.Hour)) // 2週間前
+	receiver, s, _ := testIngest(t, "["+old+"]")
+
+	if err := receiver.backfill(context.Background(), true); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if got := len(s.queue); got != 0 {
+		t.Errorf("queued %d two-week-old events, want 0", got)
+	}
+	// 通知しないだけで、鍵は登録します。この後WebSocketで同じものが
+	// 流れてきた時に二重にならないためです。
+	if receiver.dedup.len() == 0 {
+		t.Error("the stale event was not registered for deduplication")
+	}
+}
+
+// 地平線の境目。内側は通知し、外側は通知しません。
+func TestBackfillHorizonBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+		want int
+	}{
+		{"just inside the horizon", backfillHorizon - time.Minute, 1},
+		{"just outside the horizon", backfillHorizon + time.Minute, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			receiver, s, _ := testIngest(t, "["+quakeAt(time.Now().Add(-tc.age))+"]")
+			if err := receiver.backfill(context.Background(), true); err != nil {
+				t.Fatalf("backfill: %v", err)
+			}
+			if got := len(s.queue); got != tc.want {
+				t.Errorf("queued %d events, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// 時刻が読めないイベントは通知しません。上流が表記を変えた時に、日付の
+// 分からない緊急地震速報を送るより送らないほうが安全です。
+func TestBackfillSkipsEventsWithUnreadableTime(t *testing.T) {
+	broken := `{"code":551,"time":"not a timestamp","earthquake":{"maxScale":30,"hypocenter":{"name":"東京湾"}},"issue":{"source":"気象庁","type":"DetailScale","time":"not a timestamp"}}`
+	receiver, s, _ := testIngest(t, "["+broken+"]")
+
+	if err := receiver.backfill(context.Background(), true); err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if got := len(s.queue); got != 0 {
+		t.Errorf("queued %d undateable events, want 0", got)
+	}
+}
+
+// 重複排除の保持期間は補完の地平線より長くなければなりません。短いと、
+// 地平線の内側にあるイベントの鍵が先に消え、再接続のたびに再通知されます。
+// この関係が壊れると事故が再発するので、定数の側で縛ります。
+func TestDedupTTLOutlivesBackfillHorizon(t *testing.T) {
+	if dedupTTL <= backfillHorizon {
+		t.Fatalf("dedupTTL (%s) must be longer than backfillHorizon (%s); events inside the horizon would be re-notified once their key expires",
+			dedupTTL, backfillHorizon)
 	}
 }
 
@@ -154,7 +242,7 @@ func TestBackfillSurvivesOneFailingCode(t *testing.T) {
 		switch r.URL.Query().Get("codes") {
 		case "551":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, "["+quakeTokyo+"]")
+			_, _ = fmt.Fprint(w, "["+quakeAt(time.Now().Add(-2*time.Minute))+"]")
 		case "552":
 			w.WriteHeader(http.StatusInternalServerError)
 		default:
