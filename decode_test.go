@@ -48,6 +48,63 @@ const (
 		"areas": [{"pref": "岩手県", "name": "岩手県内陸北部", "scaleFrom": 50, "scaleTo": 50}]
 	}`
 
+	// eewTraining と同じ eventId の第2報。続報が第1報のメッセージを書き換えるか
+	// 確かめるために使います。
+	eewTrainingSerial2 = `{
+		"code": 556,
+		"time": "2024/01/01 10:00:12.000",
+		"test": true,
+		"issue": {"time": "2024/01/01 10:00:12", "eventId": "99999999999999", "serial": "2"},
+		"earthquake": {"hypocenter": {"name": "訓練", "depth": 10, "magnitude": 7.4}},
+		"areas": [{"pref": "岩手県", "name": "岩手県内陸北部", "scaleFrom": 55, "scaleTo": 60}]
+	}`
+
+	// 2026/08/10 09:48 の熊本の地震について気象庁が出した3報。/v2/history の
+	// 実データに合わせています。続報が必ずしも詳しくないことがこれで分かります
+	// (2報目は震源が判明する代わりに最大震度が -1 に戻る)。
+	quakeScalePrompt = `{
+		"code": 551,
+		"time": "2026/08/10 09:49:45.000",
+		"earthquake": {
+			"time": "2026/08/10 09:48:00",
+			"hypocenter": {"name": "", "latitude": -200, "longitude": -200, "depth": -1, "magnitude": -1},
+			"maxScale": 30,
+			"domesticTsunami": "Checking"
+		},
+		"issue": {"source": "気象庁", "time": "2026/08/10 09:49:44", "type": "ScalePrompt", "correct": "None"},
+		"points": [{"pref": "熊本県", "addr": "熊本県天草・芦北", "isArea": true, "scale": 30}]
+	}`
+
+	quakeDestination = `{
+		"code": 551,
+		"time": "2026/08/10 09:51:03.000",
+		"earthquake": {
+			"time": "2026/08/10 09:48:00",
+			"hypocenter": {"name": "熊本県天草・芦北地方", "latitude": 32.3, "longitude": 130.5, "depth": 10, "magnitude": 4.0},
+			"maxScale": -1,
+			"domesticTsunami": "None"
+		},
+		"issue": {"source": "気象庁", "time": "2026/08/10 09:51:02", "type": "Destination", "correct": "None"},
+		"points": []
+	}`
+
+	quakeDetailScale = `{
+		"code": 551,
+		"time": "2026/08/10 09:52:21.000",
+		"earthquake": {
+			"time": "2026/08/10 09:48:00",
+			"hypocenter": {"name": "熊本県天草・芦北地方", "latitude": 32.3, "longitude": 130.5, "depth": 10, "magnitude": 4.0},
+			"maxScale": 30,
+			"domesticTsunami": "None"
+		},
+		"issue": {"source": "気象庁", "time": "2026/08/10 09:52:20", "type": "DetailScale", "correct": "None"},
+		"points": [
+			{"pref": "熊本県", "addr": "上天草市大矢野町", "isArea": false, "scale": 30},
+			{"pref": "熊本県", "addr": "芦北町芦北", "isArea": false, "scale": 30},
+			{"pref": "熊本県", "addr": "八代市千丁町", "isArea": false, "scale": 20}
+		]
+	}`
+
 	quakeTokyo = `{
 		"code": 551,
 		"time": "2024/01/01 12:34:56.000",
@@ -184,12 +241,76 @@ func TestDecodeQuake(t *testing.T) {
 	if e.MaxScale != scale3 {
 		t.Errorf("MaxScale = %d, want %d", e.MaxScale, scale3)
 	}
-	if e.GroupKey != "" {
-		t.Errorf("GroupKey = %q, want empty (only EEW groups)", e.GroupKey)
+	if e.GroupKey == "" {
+		t.Error("GroupKey is empty; follow-up reports would post as new messages")
 	}
 	want := []string{"東京都", "神奈川県"}
 	if !sameStringSet(e.Prefectures, want) {
 		t.Errorf("Prefectures = %v, want %v", e.Prefectures, want)
+	}
+}
+
+// 1回の地震についての3報は同じ鍵でまとまり、かつ別々のイベントとして
+// 処理される必要があります。まとまらないと「震源調査中 で地震」という
+// 途中経過の表示がチャンネルに残り続けます。
+func TestQuakeReportsOfOneEarthquakeShareGroupKey(t *testing.T) {
+	prompt := decodeOrFail(t, quakeScalePrompt)
+	destination := decodeOrFail(t, quakeDestination)
+	detail := decodeOrFail(t, quakeDetailScale)
+
+	if prompt.GroupKey != destination.GroupKey || prompt.GroupKey != detail.GroupKey {
+		t.Errorf("GroupKeys differ across reports of one earthquake: %q / %q / %q",
+			prompt.GroupKey, destination.GroupKey, detail.GroupKey)
+	}
+	// 別の地震とは混ざりません。
+	if other := decodeOrFail(t, quakeTokyo); other.GroupKey == prompt.GroupKey {
+		t.Error("a different earthquake shares the GroupKey")
+	}
+	// 鍵が同じでも各報は個別に処理されます(重複排除で落ちてはいけません)。
+	keys := map[string]bool{prompt.DedupKey: true, destination.DedupKey: true, detail.DedupKey: true}
+	if len(keys) != 3 {
+		t.Errorf("the three reports collapsed into %d dedup keys", len(keys))
+	}
+}
+
+// 続報は必ずしも詳しくありません。合成しないと、震源が判明する2報目で
+// 最大震度が「不明」に後退します。
+func TestMergeQuakeReportsKeepsWhatWasAlreadyKnown(t *testing.T) {
+	prompt := decodeOrFail(t, quakeScalePrompt).Payload.(jmaQuake)
+	destination := decodeOrFail(t, quakeDestination).Payload.(jmaQuake)
+
+	merged := mergeQuakeReports(prompt, destination)
+
+	// 2報目で新たに判明したもの。
+	if merged.Earthquake.Hypocenter.Name != "熊本県天草・芦北地方" {
+		t.Errorf("hypocenter = %q, want the newly reported name", merged.Earthquake.Hypocenter.Name)
+	}
+	if merged.Earthquake.Hypocenter.Magnitude != 4.0 {
+		t.Errorf("magnitude = %v, want 4", merged.Earthquake.Hypocenter.Magnitude)
+	}
+	if merged.Earthquake.Hypocenter.Depth != 10 {
+		t.Errorf("depth = %v, want 10", merged.Earthquake.Hypocenter.Depth)
+	}
+	// 1報目でしか分かっていないもの。ここが落ちると表示が後退します。
+	if merged.Earthquake.MaxScale != scale3 {
+		t.Errorf("maxScale = %d, want %d carried over from the first report", merged.Earthquake.MaxScale, scale3)
+	}
+	if len(merged.Points) != 1 {
+		t.Errorf("points = %d, want the first report's 1 kept (the second carries none)", len(merged.Points))
+	}
+	// 「調査中」から確定した値へは進みます。
+	if merged.Earthquake.DomesticTsunami != "None" {
+		t.Errorf("domesticTsunami = %q, want the settled None", merged.Earthquake.DomesticTsunami)
+	}
+
+	// 3報目は各地の震度を伴うので、そちらが優先されます。
+	detail := decodeOrFail(t, quakeDetailScale).Payload.(jmaQuake)
+	final := mergeQuakeReports(merged, detail)
+	if len(final.Points) != 3 {
+		t.Errorf("points = %d, want the detailed report's 3", len(final.Points))
+	}
+	if final.Earthquake.MaxScale != scale3 {
+		t.Errorf("maxScale = %d, want %d", final.Earthquake.MaxScale, scale3)
 	}
 }
 

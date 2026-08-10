@@ -62,14 +62,70 @@ func decodeJMAQuake(raw json.RawMessage) (*event, error) {
 		message.Issue.Source, message.Issue.Type, message.Issue.Time,
 		message.Issue.Correct, message.Earthquake.Time)
 
+	// 1回の地震について、気象庁は分かった順に何度も発表します
+	// (震度速報 → 震源に関する情報 → 各地の震度に関する情報)。地震IDのような
+	// ものは無いので、全報で一致する発生時刻を鍵にします。秒まで含むので、
+	// 別々の地震が同じ鍵になることは実質ありません。
+	group := ""
+	if message.Earthquake.Time != "" {
+		group = dedupKey(codeJMAQuake, message.Earthquake.Time)
+	}
+
 	return &event{
 		Code:        codeJMAQuake,
 		Raw:         raw,
 		Payload:     message,
 		DedupKey:    key,
+		GroupKey:    group,
 		MaxScale:    message.Earthquake.MaxScale,
 		Prefectures: uniqueStrings(prefectures),
 	}, nil
+}
+
+// mergeQuakeReports は同じ地震についての前の報と新しい報を1つにまとめます。
+//
+// 続報が常に詳しいとは限らないのが要点です。実際の1回の地震ではこうなります。
+//
+//	震度速報          震源=(空) M=-1 深さ=-1 最大震度=3 観測点=1
+//	震源に関する情報   震源=熊本県天草・芦北地方 M=4.0 深さ=10km 最大震度=不明 観測点=0
+//	各地の震度        震源=熊本県天草・芦北地方 M=4.0 深さ=10km 最大震度=3 観測点=76
+//
+// 単純に最新で上書きすると、2報目で最大震度が「不明」に後退します。空文字や -1 は
+// 「そうではない」ではなく「まだ分からない」なので、前の報で判明していた値を残します。
+func mergeQuakeReports(previous, next jmaQuake) jmaQuake {
+	merged := next
+
+	if merged.Earthquake.Hypocenter.Name == "" {
+		merged.Earthquake.Hypocenter = previous.Earthquake.Hypocenter
+	}
+	if merged.Earthquake.Hypocenter.Magnitude < 0 {
+		merged.Earthquake.Hypocenter.Magnitude = previous.Earthquake.Hypocenter.Magnitude
+	}
+	if merged.Earthquake.Hypocenter.Depth < 0 {
+		merged.Earthquake.Hypocenter.Depth = previous.Earthquake.Hypocenter.Depth
+	}
+	if merged.Earthquake.Time == "" {
+		merged.Earthquake.Time = previous.Earthquake.Time
+	}
+
+	// 震度は強いほうを残します。震源に関する情報は震度を伴わず -1 で来るので、
+	// そのまま採ると震度速報で判明していた値が消えます。
+	if previous.Earthquake.MaxScale > merged.Earthquake.MaxScale {
+		merged.Earthquake.MaxScale = previous.Earthquake.MaxScale
+	}
+
+	// 津波の判定は「調査中」から確定値へ進むので、新しい報の値を優先します。
+	// ただし空や不明で上書きはしません。
+	if merged.Earthquake.DomesticTsunami == "" || merged.Earthquake.DomesticTsunami == "Unknown" {
+		merged.Earthquake.DomesticTsunami = previous.Earthquake.DomesticTsunami
+	}
+
+	// 各地の震度は多いほうを残します。観測点を持たない報で消してはいけません。
+	if len(merged.Points) < len(previous.Points) {
+		merged.Points = previous.Points
+	}
+
+	return merged
 }
 
 func decodeJMATsunami(raw json.RawMessage) (*event, error) {

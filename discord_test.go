@@ -95,6 +95,60 @@ func TestFollowUpReportEditsTheFirstMessage(t *testing.T) {
 	}
 }
 
+// 1回の地震についての3報が1通にまとまり、最終的な表示に情報の後退が
+// 無いことを確かめます。ユーザーから「『震源調査中 で地震』が残っているのは嫌だ」
+// と指摘された挙動への回帰テストです。
+func TestQuakeReportsCollapseIntoOneMessage(t *testing.T) {
+	server := newRecordingServer(t, func(attempt int, w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"777"}`))
+	})
+	s := testSink(t, server.URL)
+	ctx := context.Background()
+
+	for _, raw := range []string{quakeScalePrompt, quakeDestination, quakeDetailScale} {
+		s.deliver(ctx, decodeOrFail(t, raw))
+	}
+
+	requests := server.recorded()
+	if len(requests) != 3 {
+		t.Fatalf("got %d requests, want 3", len(requests))
+	}
+	if requests[0].method != http.MethodPost {
+		t.Errorf("first request = %s, want POST", requests[0].method)
+	}
+	for _, index := range []int{1, 2} {
+		if requests[index].method != http.MethodPatch {
+			t.Errorf("request %d = %s, want PATCH (a follow-up must edit, not pile up)", index, requests[index].method)
+		}
+	}
+
+	// 2通目(震源に関する情報)の時点で、震源が入りつつ最大震度が残っていること。
+	// 合成しないとここが「最大震度不明」に後退します。
+	middle := requests[1].body.Embeds[0]
+	if !strings.Contains(middle.Description, "熊本県天草・芦北地方") {
+		t.Errorf("second edit description = %q, want the newly known hypocenter", middle.Description)
+	}
+	if strings.Contains(middle.Description, "震度不明") {
+		t.Errorf("second edit description = %q; the intensity from the first report was lost", middle.Description)
+	}
+
+	// 最終形。「震源調査中」がどこにも残っていないこと。
+	final := requests[2].body.Embeds[0]
+	if strings.Contains(final.Description, "震源調査中") {
+		t.Errorf("final description = %q still says the hypocenter is being investigated", final.Description)
+	}
+	if !strings.Contains(final.Description, "最大震度3") {
+		t.Errorf("final description = %q, want 最大震度3", final.Description)
+	}
+	if !hasField(final, "規模", "M4.0") {
+		t.Errorf("final embed lost the magnitude: %+v", final.Fields)
+	}
+	if !hasField(final, "震度3", "上天草市大矢野町") {
+		t.Errorf("final embed lost the detailed points: %+v", final.Fields)
+	}
+}
+
 // 別の地震(EventIDが違う)は書き換えではなく新規投稿でなければなりません。
 func TestDifferentEventPostsANewMessage(t *testing.T) {
 	server := newRecordingServer(t, func(attempt int, w http.ResponseWriter) {

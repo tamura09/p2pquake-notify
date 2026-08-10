@@ -45,6 +45,11 @@ type sink struct {
 type groupMessage struct {
 	id      string
 	written time.Time
+
+	// quake は551の積み上げ状態。気象庁の続報は必ずしも前より詳しくないので、
+	// これまでに判明した値を持ち回って書き換えのたびに合成します
+	// (mergeQuakeReports を参照)。551以外では nil です。
+	quake *jmaQuake
 }
 
 func newSink(r route, client *http.Client, zone *time.Location) *sink {
@@ -87,22 +92,36 @@ func (s *sink) run(ctx context.Context) {
 	}
 }
 
+// deliver は1イベントを送ります。同じ地震についての続報は、新しいメッセージを
+// 積むのではなく最初のメッセージを書き換えます。
+//
+//   - 緊急地震速報(556)は同一EventIDの第1報〜最終報。大きな地震では10報以上
+//     届くので、都度投稿するとチャンネルが埋まり、スマホが鳴り続けます。
+//   - 地震情報(551)は同一発生時刻の震度速報〜各地の震度。書き換えないと
+//     「震源調査中 で地震」のような、途中経過でしかない表示が残り続けます。
 func (s *sink) deliver(ctx context.Context, e *event) {
-	payload := renderPayload(e, s.zone)
+	existing, hasGroup := s.messages[e.GroupKey]
+	if e.GroupKey == "" || time.Since(existing.written) >= groupTTL {
+		hasGroup = false
+	}
 
-	// 緊急地震速報の第2報以降は、新しいメッセージを積むのではなく
-	// 第1報のメッセージを書き換えます。大きな地震では10報以上届くので、
-	// 都度投稿するとチャンネルが埋まり、かつスマホが鳴り続けます。
-	if e.GroupKey != "" {
-		if existing, ok := s.messages[e.GroupKey]; ok && time.Since(existing.written) < groupTTL {
-			if err := s.edit(ctx, existing.id, payload); err == nil {
-				s.messages[e.GroupKey] = groupMessage{id: existing.id, written: time.Now()}
-				return
-			} else {
-				// 書き換えに失敗したら新規投稿に切り替えます。続報が
-				// まったく届かないよりは、重複してでも届くほうがましです。
-				log.Printf("route=%s edit message %s failed, posting new: %v", s.route.Name, existing.id, err)
-			}
+	// 551は前の報で判明していた値を引き継いでから描画します。そうしないと、
+	// 震度を伴わない「震源に関する情報」で書き換えた瞬間に、震度速報で
+	// 分かっていた最大震度が「不明」に後退します。
+	rendered := e
+	if hasGroup {
+		rendered = withMergedQuake(existing, e)
+	}
+	payload := renderPayload(rendered, s.zone)
+
+	if hasGroup {
+		if err := s.edit(ctx, existing.id, payload); err == nil {
+			s.rememberGroup(e.GroupKey, existing.id, rendered)
+			return
+		} else {
+			// 書き換えに失敗したら新規投稿に切り替えます。続報が
+			// まったく届かないよりは、重複してでも届くほうがましです。
+			log.Printf("route=%s edit message %s failed, posting new: %v", s.route.Name, existing.id, err)
 		}
 	}
 
@@ -115,9 +134,39 @@ func (s *sink) deliver(ctx context.Context, e *event) {
 	notifySent.Add(1)
 
 	if e.GroupKey != "" && id != "" {
-		s.messages[e.GroupKey] = groupMessage{id: id, written: time.Now()}
+		s.rememberGroup(e.GroupKey, id, rendered)
 		s.pruneGroups()
 	}
+}
+
+func (s *sink) rememberGroup(key, id string, e *event) {
+	s.messages[key] = groupMessage{id: id, written: time.Now(), quake: quakePayload(e)}
+}
+
+// withMergedQuake は積み上げ済みの551と新しい報を合成した event を返します。
+// 551以外、または積み上げがまだ無い場合は元の event をそのまま返します。
+func withMergedQuake(existing groupMessage, e *event) *event {
+	if existing.quake == nil {
+		return e
+	}
+	next, ok := e.Payload.(jmaQuake)
+	if !ok {
+		return e
+	}
+
+	merged := mergeQuakeReports(*existing.quake, next)
+	combined := *e
+	combined.Payload = merged
+	combined.MaxScale = merged.Earthquake.MaxScale
+	return &combined
+}
+
+func quakePayload(e *event) *jmaQuake {
+	message, ok := e.Payload.(jmaQuake)
+	if !ok {
+		return nil
+	}
+	return &message
 }
 
 func (s *sink) pruneGroups() {
