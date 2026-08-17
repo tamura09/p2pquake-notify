@@ -25,8 +25,8 @@ const (
 	colorEEW      = 0xE03131 // 緊急地震速報(警報)
 	colorTsunami  = 0xC2255C // 津波警報・注意報
 	colorSevere   = 0xF76707 // 震度5弱以上
-	colorModerate = 0xF59F00 // 震度3〜4
-	colorInfo     = 0x4C6EF5 // 震度1〜2、その他の地震情報
+	colorModerate = 0xF59F00 // 震度4
+	colorInfo     = 0x4C6EF5 // 震度3以下、その他の地震情報
 	colorMuted    = 0x868E96 // 地震の発生とは限らないもの、未対応のcode
 )
 
@@ -351,11 +351,14 @@ func quakePointFields(points []quakePoint) []discordEmbedField {
 	return fields
 }
 
+// quakeColor は最大震度から色帯を選びます。スマホの通知一覧では色が最初に
+// 目に入るので、しきい値は「見て身構えるかどうか」の境目に置きます。
+// 震度3は物が落ちる揺れではないので、色を変えるのは震度4からです。
 func quakeColor(maxScale int) int {
 	switch {
 	case maxScale >= scale5Lower:
 		return colorSevere
-	case maxScale >= scale3:
+	case maxScale >= scale4:
 		return colorModerate
 	default:
 		return colorInfo

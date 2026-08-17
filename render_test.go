@@ -67,6 +67,28 @@ func TestRenderTsunamiOrdersBySeverity(t *testing.T) {
 	}
 }
 
+// 色帯のしきい値。震度3では色を変えず、震度4から変わります。境目は
+// 見た目だけの話に見えて、通知一覧で最初に目に入る情報なので固定します。
+func TestQuakeColourThresholds(t *testing.T) {
+	cases := []struct {
+		scale int
+		want  int
+		name  string
+	}{
+		{scaleUnknown, colorInfo, "unknown"},
+		{scale1, colorInfo, "震度1"},
+		{scale3, colorInfo, "震度3"},
+		{scale4, colorModerate, "震度4"},
+		{scale5Lower, colorSevere, "震度5弱"},
+		{scale7, colorSevere, "震度7"},
+	}
+	for _, tc := range cases {
+		if got := quakeColor(tc.scale); got != tc.want {
+			t.Errorf("quakeColor(%s) = %#x, want %#x", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestRenderQuakeGroupsPointsByScale(t *testing.T) {
 	e := decodeOrFail(t, quakeTokyo)
 	embed := renderPayload(e, testZone()).Embeds[0]
