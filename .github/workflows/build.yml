@@ -52,7 +52,15 @@ jobs:
   deploy:
     name: Deploy
     needs: test
-    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    # workflow_dispatch も通します。コードを変えずに再デプロイしたい時があるためです。
+    # Fargate のプラットフォーム更新でタスクが退役する時など、入れ替わる瞬間を自分で
+    # 選びたい場面がそれにあたります(このサービスは新旧のタスクを重ねない設定なので、
+    # 入れ替えの間は通知が止まります。起きている時間に済ませたい)。
+    #
+    # ここを push 限定にしておくと、その操作をするのに手元でアカウントの認証情報を
+    # 使うことになります。このジョブが assume するロールは ECR の p2pquake-notify
+    # リポジトリと、ECS の同名サービスへの UpdateService だけに絞られています。
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     defaults:
       run:
