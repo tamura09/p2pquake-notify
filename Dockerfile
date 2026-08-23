@@ -1,7 +1,7 @@
 # ビルドは常にランナーのネイティブアーキテクチャで行い、GOARCH だけを arm64 に
 # します。最終段を --platform=linux/arm64 で組んでもコンパイルはここで済んでいるので、
 # QEMU エミュレーションは一切走りません(エミュレーション下のGoビルドは数分かかります)。
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 
 WORKDIR /src
 
