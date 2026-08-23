@@ -159,7 +159,7 @@ func TestLargeQuakeStaysWithinDiscordLimits(t *testing.T) {
 		if !strings.HasPrefix(field.Name, "震度") {
 			continue
 		}
-		for _, line := range strings.Split(field.Value, "\n") {
+		for line := range strings.SplitSeq(field.Value, "\n") {
 			if !strings.HasPrefix(line, "- ") && !strings.HasPrefix(line, municipalityIndent) && !strings.HasPrefix(line, "…ほか ") {
 				t.Errorf("field %q has a broken list line %q", field.Name, line)
 			}

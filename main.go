@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -100,17 +99,13 @@ func main() {
 
 	var wg sync.WaitGroup
 	for _, s := range sinks {
-		wg.Add(1)
-		go func(s *sink) {
-			defer wg.Done()
+		wg.Go(func() {
 			s.run(ctx)
-		}(s)
+		})
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		pusher.run(ctx)
-	}()
+	})
 
 	receiver.run(ctx)
 
@@ -187,9 +182,10 @@ func warmUpDiscord(ctx context.Context, client *http.Client) {
 		log.Printf("warm-up request to discord.com failed (continuing): %v", err)
 		return
 	}
-	defer resp.Body.Close()
 	// 本文を読み切らないとこの接続は再利用されず、温めた意味がなくなります。
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	// Go 1.27 の Close は未読分を読み切ってから接続を返すので(256KBまで、
+	// 50msまで)、ここで自分で捨てる必要はもうありません。
+	resp.Body.Close()
 }
 
 // resolve は Grafana Cloud の接続情報を SSM から読みます。URLのパラメータ名が
