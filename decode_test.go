@@ -105,6 +105,40 @@ const (
 		]
 	}`
 
+	// eewIwateSerial1 と同じ地震についての地震情報。緊急地震速報の
+	// earthquake.originTime (16:10:00) と地震情報の earthquake.time は推定値と
+	// 確定値の違いで数秒ずれます。同じ地震だと判定できなければいけません。
+	quakeSanriku = `{
+		"code": 551,
+		"time": "2024/01/01 16:14:10.000",
+		"earthquake": {
+			"time": "2024/01/01 16:10:04",
+			"hypocenter": {"name": "三陸沖", "latitude": 39.5, "longitude": 143.2, "depth": 30, "magnitude": 7.4},
+			"maxScale": 50,
+			"domesticTsunami": "Warning"
+		},
+		"issue": {"source": "気象庁", "time": "2024/01/01 16:14:09", "type": "DetailScale", "correct": "None"},
+		"points": [
+			{"pref": "岩手県", "addr": "宮古市田老", "isArea": false, "scale": 50},
+			{"pref": "青森県", "addr": "八戸市内丸", "isArea": false, "scale": 40}
+		]
+	}`
+
+	// 12分後の余震。緊急地震速報は出ていないので、速報を流したチャンネルに
+	// これを混ぜてはいけません。発生時刻の許容幅を広げすぎると拾ってしまいます。
+	quakeSanrikuAftershock = `{
+		"code": 551,
+		"time": "2024/01/01 16:24:30.000",
+		"earthquake": {
+			"time": "2024/01/01 16:22:10",
+			"hypocenter": {"name": "三陸沖", "latitude": 39.4, "longitude": 143.1, "depth": 30, "magnitude": 4.8},
+			"maxScale": 30,
+			"domesticTsunami": "None"
+		},
+		"issue": {"source": "気象庁", "time": "2024/01/01 16:24:29", "type": "DetailScale", "correct": "None"},
+		"points": [{"pref": "岩手県", "addr": "宮古市田老", "isArea": false, "scale": 30}]
+	}`
+
 	quakeTokyo = `{
 		"code": 551,
 		"time": "2024/01/01 12:34:56.000",

@@ -42,6 +42,12 @@ type ingest struct {
 	apiClient *http.Client
 
 	dedup *dedupCache
+
+	// eewQuakes は「どのルートがどの地震について緊急地震速報を流したか」。
+	// 受信goroutineだけが触ります(dispatch と backfill は同じgoroutineから
+	// 呼ばれるので、ロックは要りません)。
+	eewQuakes eewQuakes
+
 	sinks []*sink
 }
 
@@ -166,11 +172,66 @@ func (i *ingest) dispatch(e *event) {
 		return
 	}
 
+	i.fanOut(e)
+}
+
+// fanOut は1イベントを通すべきルートすべてへ渡します。
+//
+// 通常の判定に加えて、緊急地震速報を流したルート(QuakeAfterEEW)には、その地震に
+// ついての地震情報(551)も渡します。速報は予想でしかないので、実際にどこがどれだけ
+// 揺れたのかを同じチャンネルで見せないと話が途中で終わります。
+func (i *ingest) fanOut(e *event) {
 	for _, s := range i.sinks {
-		if s.route.matches(e) {
+		switch {
+		case s.route.matches(e):
+			i.rememberEEWQuake(s.route, e)
+			s.offer(e)
+		case i.isQuakeAfterEEW(s.route, e):
 			s.offer(e)
 		}
 	}
+}
+
+// rememberEEWQuake は、緊急地震速報を流したルートについて、その地震の発生時刻を
+// 覚えます。551 との突き合わせに使うので、対象は QuakeAfterEEW のルートだけです。
+func (i *ingest) rememberEEWQuake(r route, e *event) {
+	if !r.QuakeAfterEEW || e.Code != codeEEW {
+		return
+	}
+	message, ok := e.Payload.(eew)
+	if !ok || message.Cancelled {
+		// 取消報は「揺れません」という報せなので、続きの地震情報を待つ理由が
+		// ありません。すでに覚えている発生時刻はそのままにします(取消の前に
+		// 出した速報については、結果が出るなら見せたいため)。
+		return
+	}
+	origin, ok := parseP2PTime(message.Earthquake.OriginTime, i.cfg.Zone)
+	if !ok {
+		// 発生時刻が読めない速報は突き合わせようがないので覚えません。
+		// 551 を無関係な地震で流すよりは、流さないほうが害が小さいためです。
+		return
+	}
+	i.eewQuakes.record(r.Name, origin)
+}
+
+// isQuakeAfterEEW は、このルートが緊急地震速報を流した地震についての地震情報かを返します。
+func (i *ingest) isQuakeAfterEEW(r route, e *event) bool {
+	if !r.QuakeAfterEEW || e.Code != codeJMAQuake {
+		return false
+	}
+	// code の条件だけを外し、訓練報・震度しきい値・地域フィルタは効かせます。
+	if !r.allows(e) {
+		return false
+	}
+	message, ok := e.Payload.(jmaQuake)
+	if !ok {
+		return false
+	}
+	at, ok := parseP2PTime(message.Earthquake.Time, i.cfg.Zone)
+	if !ok {
+		return false
+	}
+	return i.eewQuakes.matches(r.Name, at)
 }
 
 // backfillCodes は履歴から拾い直す code。
@@ -279,11 +340,7 @@ func (i *ingest) backfill(ctx context.Context, notify bool) error {
 		}
 		notified++
 		backfilledEvents.Add(1)
-		for _, s := range i.sinks {
-			if s.route.matches(item.e) {
-				s.offer(item.e)
-			}
-		}
+		i.fanOut(item.e)
 	}
 
 	// 1件1行ではなく1回1行にします。件数の内訳が見えないと、大量の再送が
