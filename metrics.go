@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"sort"
 	"sync/atomic"
@@ -112,9 +113,7 @@ func buildTimeSeries(now time.Time, started time.Time) []prompb.TimeSeries {
 
 func gauge(name string, labels map[string]string, value float64, timestamp int64) prompb.TimeSeries {
 	merged := map[string]string{"__name__": name, "job": metricJobLabel}
-	for key, labelValue := range labels {
-		merged[key] = labelValue
-	}
+	maps.Copy(merged, labels)
 
 	names := make([]string, 0, len(merged))
 	for key := range merged {
