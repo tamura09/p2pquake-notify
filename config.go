@@ -99,6 +99,11 @@ func loadConfig(ctx context.Context, resolver parameterResolver) (config, error)
 					WebhookURL: webhook,
 					Codes:      codeSet(codeEEW, codeJMATsunami),
 					MinScale:   scaleUnknown,
+					// 緊急地震速報を流した地震については、あとから出る
+					// 地震情報(551)も同じチャンネルへ流します。速報は
+					// 「これから揺れる」という予想でしかなく、実際にどこが
+					// どれだけ揺れたのかは551にしか載らないためです。
+					QuakeAfterEEW: true,
 				}
 			},
 		},

@@ -27,6 +27,15 @@ type route struct {
 	// IncludeTest は訓練報・テスト配信を通すか。dev以外では必ず false です。
 	// 訓練報を本番の通知先に流すと、いざという時に誰も信じなくなります。
 	IncludeTest bool
+
+	// QuakeAfterEEW が true なら、このルートが緊急地震速報(556)を流した地震に
+	// ついては、Codes に 551 が無くても地震情報(551)を通します。
+	//
+	// 緊急地震速報は「これから揺れる」という予想で、実際に何が起きたのかは
+	// 後から出る地震情報にしか載りません。速報だけのチャンネルは「震度5弱を予想」で
+	// 話が終わり、本当に揺れたのか、どこが揺れたのかが分からないままになります。
+	// 突き合わせは ingest が持つ eewQuakes が発生時刻で行います。
+	QuakeAfterEEW bool
 }
 
 // neverNotified はどのルートへも流さない code。
@@ -52,18 +61,24 @@ var neverNotified = map[int]struct{}{
 }
 
 func (r route) matches(e *event) bool {
+	if len(r.Codes) > 0 {
+		if _, ok := r.Codes[e.Code]; !ok {
+			return false
+		}
+	}
+	return r.allows(e)
+}
+
+// allows は code の絞り込み以外のすべての条件を見ます。緊急地震速報を出した
+// 地震の続きとして 551 を通す時(QuakeAfterEEW)、code の条件だけを外して
+// 訓練報・震度しきい値・地域フィルタはそのまま効かせるために分けています。
+func (r route) allows(e *event) bool {
 	if _, blocked := neverNotified[e.Code]; blocked {
 		return false
 	}
 
 	if e.Test && !r.IncludeTest {
 		return false
-	}
-
-	if len(r.Codes) > 0 {
-		if _, ok := r.Codes[e.Code]; !ok {
-			return false
-		}
 	}
 
 	// 震度しきい値は「震度が分かっているイベント」にだけ効かせます。
@@ -119,6 +134,9 @@ func (r route) String() string {
 	}
 	if r.IncludeTest {
 		parts = append(parts, "includeTest=true")
+	}
+	if r.QuakeAfterEEW {
+		parts = append(parts, "quakeAfterEEW=true")
 	}
 	return strings.Join(parts, " ")
 }
