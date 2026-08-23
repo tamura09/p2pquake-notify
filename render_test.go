@@ -108,11 +108,13 @@ func TestRenderQuakeGroupsPointsByScale(t *testing.T) {
 // 大地震では観測点が数百に達します。上限を超えたペイロードは400で丸ごと
 // 拒否されるので、「全部送れないなら一部だけでも送る」ことを確認します。
 func TestLargeQuakeStaysWithinDiscordLimits(t *testing.T) {
+	prefs := []string{"岩手県", "宮城県", "青森県"}
 	points := make([]quakePoint, 0, 600)
 	for index := range 600 {
 		points = append(points, quakePoint{
-			Pref:  "岩手県",
-			Addr:  fmt.Sprintf("架空市第%d観測点", index),
+			Pref: prefs[index%len(prefs)],
+			// 市区町村まで丸めても畳まれないよう、1点ずつ別の市にします。
+			Addr:  fmt.Sprintf("架空%d市第%d観測点", index, index),
 			Scale: []int{scale7, scale6Upper, scale6Lower, scale5Upper, scale4, scale3}[index%6],
 		})
 	}
@@ -146,11 +148,140 @@ func TestLargeQuakeStaysWithinDiscordLimits(t *testing.T) {
 	}
 	// 切り詰めても一番強い震度は残っていなければ意味がありません。
 	// 弱い震度から順に落とすので、震度7は必ず生き残ります。
-	if !hasField(embed, "震度7", "架空市") {
+	if !hasField(embed, "震度7", "架空0市") {
 		t.Errorf("震度7 was dropped from a truncated embed; got %+v", fieldNames(embed))
 	}
-	if hasField(embed, "震度3", "架空市") {
+	if hasField(embed, "震度3", "架空") {
 		t.Errorf("震度3 survived; weak scales should be dropped first, got %+v", fieldNames(embed))
+	}
+	// 打ち切りは行単位で、省略したことが件数で分かる必要があります。
+	for _, field := range embed.Fields {
+		if !strings.HasPrefix(field.Name, "震度") {
+			continue
+		}
+		for _, line := range strings.Split(field.Value, "\n") {
+			if !strings.HasPrefix(line, "- ") && !strings.HasPrefix(line, municipalityIndent) && !strings.HasPrefix(line, "…ほか ") {
+				t.Errorf("field %q has a broken list line %q", field.Name, line)
+			}
+		}
+		if !strings.Contains(field.Value, "…ほか ") {
+			t.Errorf("field %q listed every municipality without a note that it was cut: %q", field.Name, field.Value)
+		}
+	}
+}
+
+// 観測点名をそのまま並べると同じ市が何度も出てきて読めません。都道府県ごとに
+// 市区町村までへ畳んだ入れ子箇条書きになっていることを確かめます。
+func TestQuakePointsCollapseToMunicipalitiesByPrefecture(t *testing.T) {
+	message := jmaQuake{
+		Earthquake: quakeDetail{
+			Hypocenter: hypocenter{Name: "茨城県南部", Depth: 70, Magnitude: 5.9},
+			MaxScale:   scale5Lower,
+		},
+		Issue: quakeIssue{Source: "気象庁", Type: "DetailScale"},
+		Points: []quakePoint{
+			{Pref: "茨城県", Addr: "つくばみらい市加藤", Scale: scale5Lower},
+			{Pref: "茨城県", Addr: "つくばみらい市福田", Scale: scale5Lower},
+			{Pref: "茨城県", Addr: "つくば市小茎", Scale: scale5Lower},
+			{Pref: "埼玉県", Addr: "蕨市中央", Scale: scale5Lower},
+			// 政令指定都市の区は市まで丸めるので、2点で1件になります。
+			{Pref: "埼玉県", Addr: "さいたま北区宮原", Scale: scale5Lower},
+			{Pref: "埼玉県", Addr: "さいたま大宮区大門", Scale: scale5Lower},
+			// 東京23区は区のまま。見出しと重なる「東京」だけ落とします。
+			{Pref: "東京都", Addr: "東京足立区伊興", Scale: scale5Lower},
+			{Pref: "福島県", Addr: "いわき市平四ツ波", Scale: 20},
+			{Pref: "群馬県", Addr: "みなかみ町後閑", Scale: 20},
+			{Pref: "群馬県", Addr: "前橋市大手町", Scale: 20},
+		},
+	}
+
+	embed := renderQuake(message, testZone()).Embeds[0]
+
+	want := map[string]string{
+		"震度5弱": "- 茨城県\n  つくばみらい市、つくば市\n- 埼玉県\n  蕨市、さいたま市\n- 東京都\n  足立区",
+		"震度2":  "- 福島県\n  いわき市\n- 群馬県\n  みなかみ町、前橋市",
+	}
+	for name, value := range want {
+		if !hasField(embed, name, value) {
+			t.Errorf("field %q = %+v, want %q", name, embed.Fields, value)
+		}
+	}
+}
+
+// 震度速報(isArea)の点は市区町村ではなく地域名です。見出しの都道府県と
+// 二重にならないことを確かめます。
+func TestScalePromptListsAreasWithoutRepeatingThePrefecture(t *testing.T) {
+	embed := renderPayload(decodeOrFail(t, quakeScalePrompt), testZone()).Embeds[0]
+
+	if !hasField(embed, "震度3", "- 熊本県\n  天草・芦北") {
+		t.Errorf("expected the area listed under its prefecture; got %+v", embed.Fields)
+	}
+}
+
+// 観測点名は「市区町村名+地区名」なので最初の市区町村の字で切りますが、
+// 名前の途中にその字を含むものがあります。実データで踏んだ形を並べています。
+func TestMunicipalityCutsAtTheRightPlace(t *testing.T) {
+	cases := map[string]string{
+		"つくばみらい市加藤":  "つくばみらい市",
+		"いわき市三和町":    "いわき市",
+		"会津坂下町市中三番甲": "会津坂下町",
+		"上越市三和区井ノ口":  "上越市",
+		"みどり市大間々町":   "みどり市",
+		"中之条町中之条町":   "中之条町",
+		"龍ケ崎市役所":     "龍ケ崎市",
+		"さいたま中央区下落合": "さいたま中央区",
+		"東京足立区伊興":    "東京足立区",
+		"茨城古河市下大野":   "茨城古河市",
+		"丹波山村丹波":     "丹波山村",
+		// 先頭の1文字は必ず名前の一部。
+		"市川市八幡":  "市川市",
+		"町田市中町":  "町田市",
+		"村上市三之町": "村上市",
+		// 名前の途中に市区町村の字を含むもの。
+		"東村山市本町":   "東村山市",
+		"武蔵村山市本町":  "武蔵村山市",
+		"田村市船引町":   "田村市",
+		"四日市市日永":   "四日市市",
+		"名古屋中村区名駅": "名古屋中村区",
+		// 逆に、地区名が市区町村の字で始まるもの。
+		"阿波市市場町上喜来": "阿波市",
+	}
+	for addr, want := range cases {
+		if got := municipality(addr); got != want {
+			t.Errorf("municipality(%q) = %q, want %q", addr, got, want)
+		}
+	}
+}
+
+// 区が出るのは東京23区だけです。政令指定都市の区は市まで丸めます。
+func TestPointAreaKeepsWardsOnlyForTokyo(t *testing.T) {
+	cases := []struct {
+		point quakePoint
+		want  string
+	}{
+		// 23区は区のまま。見出しと重なる「東京」だけ落とします。
+		{quakePoint{Pref: "東京都", Addr: "東京足立区伊興"}, "足立区"},
+		{quakePoint{Pref: "東京都", Addr: "千代田区大手町"}, "千代田区"},
+		{quakePoint{Pref: "東京都", Addr: "八王子市堀之内"}, "八王子市"},
+		// 政令指定都市は市名+区名で来ます。市まで丸めます。
+		{quakePoint{Pref: "千葉県", Addr: "千葉美浜区ひび野"}, "千葉市"},
+		{quakePoint{Pref: "埼玉県", Addr: "さいたま北区宮原"}, "さいたま市"},
+		{quakePoint{Pref: "埼玉県", Addr: "さいたま大宮区大門"}, "さいたま市"},
+		{quakePoint{Pref: "神奈川県", Addr: "横浜中区山下町"}, "横浜市"},
+		{quakePoint{Pref: "愛知県", Addr: "名古屋中村区名駅"}, "名古屋市"},
+		{quakePoint{Pref: "大阪府", Addr: "大阪此花区春日出北"}, "大阪市"},
+		// 区で終わらないものには触りません。落とすと実在する別の市になったり、
+		// 名前が消えたりします。
+		{quakePoint{Pref: "大阪府", Addr: "大阪狭山市狭山"}, "大阪狭山市"},
+		{quakePoint{Pref: "山梨県", Addr: "山梨市小原西"}, "山梨市"},
+		{quakePoint{Pref: "茨城県", Addr: "茨城古河市下大野"}, "茨城古河市"},
+		// 震度速報の地域名は県名だけ落とします。
+		{quakePoint{Pref: "熊本県", Addr: "熊本県天草・芦北", IsArea: true}, "天草・芦北"},
+	}
+	for _, tc := range cases {
+		if got := pointArea(tc.point); got != tc.want {
+			t.Errorf("pointArea(%q in %s) = %q, want %q", tc.point.Addr, tc.point.Pref, got, tc.want)
+		}
 	}
 }
 
