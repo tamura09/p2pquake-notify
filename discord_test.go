@@ -144,7 +144,7 @@ func TestQuakeReportsCollapseIntoOneMessage(t *testing.T) {
 	if !hasField(final, "規模", "M4.0") {
 		t.Errorf("final embed lost the magnitude: %+v", final.Fields)
 	}
-	if !hasField(final, "震度3", "上天草市大矢野町") {
+	if !hasField(final, "震度3", "上天草市") {
 		t.Errorf("final embed lost the detailed points: %+v", final.Fields)
 	}
 }

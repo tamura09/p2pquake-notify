@@ -307,6 +307,9 @@ func renderQuake(message jmaQuake, zone *time.Location) discordWebhookPayload {
 }
 
 // quakePointFields は各地の震度を震度別にまとめ、強い順に並べます。
+// 観測点名(「つくばみらい市加藤」)をそのまま並べると同じ市が何度も出てきて
+// どこが揺れたのか読み取れないので、市区町村まで丸めて重複を畳み、
+// 都道府県ごとの入れ子箇条書きにします。
 // 大地震では観測点が数百に達するので、フィールド化する震度は上から4段階までに
 // 絞ります。震度1・2まで全部載せても埋め込み上限で切り捨てられるだけです。
 func quakePointFields(points []quakePoint) []discordEmbedField {
@@ -314,13 +317,9 @@ func quakePointFields(points []quakePoint) []discordEmbedField {
 		return nil
 	}
 
-	grouped := map[int][]string{}
+	grouped := map[int][]quakePoint{}
 	for _, point := range points {
-		label := point.Addr
-		if label == "" {
-			label = point.Pref
-		}
-		grouped[point.Scale] = append(grouped[point.Scale], label)
+		grouped[point.Scale] = append(grouped[point.Scale], point)
 	}
 
 	scales := make([]int, 0, len(grouped))
@@ -334,21 +333,216 @@ func quakePointFields(points []quakePoint) []discordEmbedField {
 
 	fields := make([]discordEmbedField, 0, len(scales))
 	for _, scale := range scales {
-		names := uniqueStrings(grouped[scale])
-		value := strings.Join(names, "、")
-		// 切り詰めで末尾が欠けるより、件数を添えて省略したと分かるほうが親切です。
-		// 余白は接尾辞の実バイト数から引きます。日本語の接尾辞は1文字3バイトなので、
-		// 文字数で見積もると上限を超えてDiscordに丸ごと拒否されます。
-		if len(value) > discordEmbedFieldValueLimit {
-			suffix := fmt.Sprintf(" ほか (計%d地点)", len(names))
-			value = truncate(value, discordEmbedFieldValueLimit-len(suffix)) + suffix
-		}
 		fields = append(fields, discordEmbedField{
 			Name:  scaleLabel(scale),
-			Value: value,
+			Value: municipalityList(grouped[scale], discordEmbedFieldValueLimit),
 		})
 	}
 	return fields
+}
+
+// prefGroup は1つの都道府県ぶんの市区町村。気象庁の並び(北から南)をそのまま
+// 見せたいので、mapではなくスライスで順序を持ちます。
+type prefGroup struct {
+	pref  string
+	areas []string
+}
+
+// groupPointsByPref は観測点を都道府県ごとの市区町村一覧に畳みます。
+// 同じ市の観測点が何十個あっても1行にまとめるのが目的です。
+func groupPointsByPref(points []quakePoint) []prefGroup {
+	groups := []prefGroup{}
+	position := map[string]int{}
+	seen := map[string]bool{}
+
+	for _, point := range points {
+		area := pointArea(point)
+		if area == "" {
+			continue
+		}
+		// 都道府県が無いのは上流の欠損。捨てると地点ごと消えてしまうので、
+		// 見出しだけ「その他」にして残します。
+		pref := firstNonEmpty(point.Pref, "その他")
+		if seen[pref+"\x00"+area] {
+			continue
+		}
+		seen[pref+"\x00"+area] = true
+
+		index, ok := position[pref]
+		if !ok {
+			index = len(groups)
+			position[pref] = index
+			groups = append(groups, prefGroup{pref: pref})
+		}
+		groups[index].areas = append(groups[index].areas, area)
+	}
+	return groups
+}
+
+// municipalityIndent は都道府県の見出しにぶら下がる市区町村の行頭。
+const municipalityIndent = "  "
+
+// municipalityList は都道府県ごとの箇条書きを組み立てます。県を見出しにして、
+// その県の市区町村は1行に並べます。1件1行にすると数十行に伸びて、
+// スマホでは1つの震度を見るだけでスクロールが必要になるためです。
+// 畳んでもなお上限に収まらないことがある(震度2・3は数百地点)ので、
+// その場合は打ち切って残り件数を添え、省略したと分かるようにします。
+func municipalityList(points []quakePoint, limit int) string {
+	groups := groupPointsByPref(points)
+	if len(groups) == 0 {
+		return ""
+	}
+
+	if value, dropped := buildMunicipalityList(groups, limit); dropped == 0 {
+		return value
+	}
+	// 注記ぶんの余白を空けて詰め直します。残り件数は総数以下なので、
+	// 総数で見積もっておけば注記が入りきらなくなることはありません。
+	total := 0
+	for _, group := range groups {
+		total += len(group.areas)
+	}
+	value, dropped := buildMunicipalityList(groups, limit-len(municipalityOverflowNote(total))-1)
+	note := municipalityOverflowNote(dropped)
+	if value == "" {
+		return truncate(note, limit)
+	}
+	return truncate(value+"\n"+note, limit)
+}
+
+func municipalityOverflowNote(count int) string {
+	return fmt.Sprintf("…ほか %d市区町村", count)
+}
+
+// buildMunicipalityList は budget バイトに収まるだけを返し、入りきらなかった
+// 市区町村の数を添えます。余白は実バイト数で数えます。日本語は1文字3バイトなので、
+// 文字数で見積もると上限を超えてDiscordに丸ごと拒否されます。
+func buildMunicipalityList(groups []prefGroup, budget int) (string, int) {
+	lines := []string{}
+	used := 0
+	written := 0
+	total := 0
+	for _, group := range groups {
+		total += len(group.areas)
+	}
+
+	for _, group := range groups {
+		header := "- " + group.pref
+		// 見出しと市区町村の行、2行ぶんの改行を先に見込みます。
+		base := used + len(header) + 1
+		line := municipalityIndent
+		count := 0
+		full := true
+		for _, area := range group.areas {
+			addition := area
+			if count > 0 {
+				addition = "、" + area
+			}
+			if base+len(line)+len(addition)+1 > budget {
+				full = false
+				break
+			}
+			line += addition
+			count++
+		}
+		// 見出しだけ書いて中身が無いと「揺れていない県」に見えるので、
+		// 1件も入らない県は見出しごと落とします。
+		if count == 0 {
+			break
+		}
+		lines = append(lines, header, line)
+		used = base + len(line) + 1
+		written += count
+		if !full {
+			break
+		}
+	}
+	return strings.Join(lines, "\n"), total - written
+}
+
+// pointArea は観測点の表示名。
+func pointArea(point quakePoint) string {
+	addr := strings.TrimSpace(point.Addr)
+	if addr == "" {
+		return ""
+	}
+	// isArea の点(震度速報)は市区町村ではなく「熊本県天草・芦北」のような
+	// 地域名なので、見出しの都道府県と重ならないよう県名だけ落とします。
+	if point.IsArea {
+		return firstNonEmpty(strings.TrimPrefix(addr, point.Pref), addr)
+	}
+
+	area := municipality(addr)
+	if !strings.HasSuffix(area, "区") {
+		return area
+	}
+	// 東京23区は区のままが分かりやすいので、見出しの都道府県と重なる
+	// 「東京」だけ落とします(「東京足立区伊興」→「足立区」)。
+	if point.Pref == "東京都" || strings.HasPrefix(area, "東京") {
+		return firstNonEmpty(strings.TrimPrefix(area, "東京"), area)
+	}
+	// 政令指定都市の区は市まで丸めます。「さいたま北区」「さいたま大宮区」が
+	// 別々に並ぶのは、都道府県ごとの市町村一覧としては細かすぎます。
+	if city := wardCity(area); city != "" {
+		return city
+	}
+	return area
+}
+
+// wardCities は区を持つ市(政令指定都市)。上流は「さいたま北区」「大阪此花区」と
+// 市名に区名を続けた形で送ってくるので、市名だけ持って前方一致で拾います。
+// 東京23区以外の区はすべてこのいずれかに属します。
+var wardCities = []string{
+	"札幌", "仙台", "さいたま", "千葉", "横浜", "川崎", "相模原", "新潟", "静岡", "浜松",
+	"名古屋", "京都", "大阪", "堺", "神戸", "岡山", "広島", "北九州", "福岡", "熊本",
+}
+
+// wardCity は「さいたま北区」→「さいたま市」。拾えなければ空文字を返し、
+// 呼び出し側は上流の表記のまま出します。知らない形を捨てるよりましです。
+func wardCity(area string) string {
+	for _, city := range wardCities {
+		if strings.HasPrefix(area, city) {
+			return city + "市"
+		}
+	}
+	return ""
+}
+
+// municipalityMarkers は市区町村名の末尾の字。
+const municipalityMarkers = "市区町村"
+
+// municipalityExceptions は名前の途中に市区町村の字を含み、素直に先頭から
+// 探すと切る位置を間違えるもの。「東村山市本町」を「東村」にしないための表です。
+// 先頭の1文字は必ず名前の一部として飛ばすので、「市原市」「町田市」「村上市」は
+// ここに要りません。逆に「阿波市市場町」「会津坂下町市中」のように地区名が
+// 市区町村の字で始まる観測点があるため、隣接する字をまとめて拾う方法は使えません。
+var municipalityExceptions = []string{
+	"東村山市", "武蔵村山市", "田村市", "羽村市", "大村市",
+	"大町市", "大町町", "十日町市", "上市町", "下市町",
+	"四日市市", "廿日市市", "野々市市", "名古屋中村区",
+}
+
+// municipality は観測点名から市区町村までを取り出します
+// (「つくばみらい市加藤」→「つくばみらい市」)。気象庁の観測点名は市区町村名に
+// 地区名を続けた形なので、最初の市区町村の字で切るのが基本です。政令指定都市と
+// 東京23区は「さいたま北区」「東京足立区」のように市名や都県名が前に付いた形で
+// 来ますが、直すと「大阪狭山市」→「狭山市」のような取り違えが起きるので、
+// 気象庁の表記のまま出します。
+func municipality(addr string) string {
+	for _, name := range municipalityExceptions {
+		if strings.HasPrefix(addr, name) {
+			return name
+		}
+	}
+
+	runes := []rune(addr)
+	for index := 1; index < len(runes); index++ {
+		if strings.ContainsRune(municipalityMarkers, runes[index]) {
+			return string(runes[:index+1])
+		}
+	}
+	// 想定外の形(「〜郡」など)は、情報を落とさないようそのまま出します。
+	return addr
 }
 
 // quakeColor は最大震度から色帯を選びます。スマホの通知一覧では色が最初に
