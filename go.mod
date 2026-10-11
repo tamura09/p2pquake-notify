@@ -2,6 +2,8 @@ module github.com/tamura09/p2pquake-notify
 
 go 1.27.0
 
+toolchain go1.27.2
+
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.77.0
