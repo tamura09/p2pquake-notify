@@ -29,6 +29,8 @@ var (
 	duplicatesDropped atomic.Int64
 	notifySent        atomic.Int64
 	notifyFailures    atomic.Int64
+	pushoverSent      atomic.Int64
+	pushoverFailures  atomic.Int64
 	wsReconnects      atomic.Int64
 	backfilledEvents  atomic.Int64
 
@@ -106,6 +108,8 @@ func buildTimeSeries(now time.Time, started time.Time) []prompb.TimeSeries {
 		gauge("p2pquake_duplicates_dropped_total", base, float64(duplicatesDropped.Load()), timestamp),
 		gauge("p2pquake_notifications_sent_total", base, float64(notifySent.Load()), timestamp),
 		gauge("p2pquake_notification_failures_total", base, float64(notifyFailures.Load()), timestamp),
+		gauge("p2pquake_pushover_sent_total", base, float64(pushoverSent.Load()), timestamp),
+		gauge("p2pquake_pushover_failures_total", base, float64(pushoverFailures.Load()), timestamp),
 		gauge("p2pquake_ws_reconnects_total", base, float64(wsReconnects.Load()), timestamp),
 		gauge("p2pquake_backfilled_events_total", base, float64(backfilledEvents.Load()), timestamp),
 	}
@@ -156,7 +160,7 @@ func (p *metricsPusher) remoteWrite(ctx context.Context, series []prompb.TimeSer
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return statusError{code: resp.StatusCode, body: string(body)}
+		return statusError{service: "grafana", code: resp.StatusCode, body: string(body)}
 	}
 	return nil
 }

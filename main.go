@@ -75,6 +75,12 @@ func main() {
 		sinks = append(sinks, newSink(r, apiClient, cfg.Zone))
 	}
 
+	var pushover *pushoverSink
+	if cfg.Pushover != nil {
+		pushover = newPushoverSink(*cfg.Pushover, apiClient, cfg.Zone)
+		log.Printf("route configured: %s", pushover.route)
+	}
+
 	// Discordへの接続を先に温めておきます。最初の1通が緊急地震速報だった場合、
 	// そこでDNS解決とTLSハンドシェイクから始めると通知が数百ミリ秒遅れます。
 	// 平常時に済ませられる仕事を、一番急いでいる瞬間に持ち込まないための準備です。
@@ -95,12 +101,18 @@ func main() {
 		apiClient: apiClient,
 		dedup:     newDedupCache(dedupTTL, dedupMaxSize),
 		sinks:     sinks,
+		pushover:  pushover,
 	}
 
 	var wg sync.WaitGroup
 	for _, s := range sinks {
 		wg.Go(func() {
 			s.run(ctx)
+		})
+	}
+	if pushover != nil {
+		wg.Go(func() {
+			pushover.run(ctx)
 		})
 	}
 	wg.Go(func() {
