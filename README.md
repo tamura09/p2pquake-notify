@@ -44,7 +44,11 @@ Pushoverは送ったものを書き換えられないため、1つの地震で10
 - 予想最大震度がそれまでに送ったものより上がった報 — 優先度 1
 - 送ったことのある地震の取消報 — 優先度 0
 
+「送った」と数えるのはPushoverが受け付けた報だけです。第1報の送信に失敗した地震は、次の報が最初の報として扱われます。
+
 津波予報は、大津波警報・津波警報を優先度 1、津波注意報と解除を優先度 0 にしています。注意報や解除まで夜中に鳴らすと、本当に逃げるべき時に慣れで無視されるためです。優先度 2（確認するまで鳴り続ける）は使っていません。
+
+再試行するのは5xxと通信エラーだけで、間隔は5秒から倍々にします（Pushoverの指定が最低5秒）。429は月間の送信上限に達したという意味で、月が替わるまで何度送っても通らないため再試行しません。
 
 トークンとユーザキーは読めなくても起動を止めません。Pushoverは追加の経路で、SSMに値を入れ忘れただけで地震の通知が全部止まるのは本末転倒だからです。読めない時は起動時に `pushover: disabled: ...` を1行出して無効になります。
 
@@ -138,6 +142,8 @@ Grafana Cloudへ毎分押し込む `p2pquake_last_message_age_seconds` を見て
 | `p2pquake_ws_connected` | WebSocketが繋がっているか (0/1) |
 | `p2pquake_ws_reconnects_total` | 再接続の累計。増え続けるなら接続が不安定 |
 | `p2pquake_notification_failures_total` | Discordへの送信に最終的に失敗した件数 |
+| `p2pquake_pushover_failures_total` | Pushoverへの送信に最終的に失敗した件数。Discordとは別に数えます |
+| `p2pquake_pushover_sent_total` | Pushoverへ送った件数 |
 | `p2pquake_messages_received_total` | 受信メッセージの累計 |
 | `p2pquake_duplicates_dropped_total` | 重複排除で落とした件数 |
 | `p2pquake_decode_failures_total` | デコードできなかった件数。増えたら上流の形式変更を疑う |

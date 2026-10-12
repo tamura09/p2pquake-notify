@@ -28,6 +28,10 @@ const (
 	// 無視して鳴らすので、本当に急ぐものだけに付けます。
 	pushoverPriorityNormal = 0
 	pushoverPriorityHigh   = 1
+
+	// pushoverRetryDelay は最初の再試行までの待ち時間。Pushover は5秒未満での
+	// 再送をやめるよう求めています。以後は倍々にします。
+	pushoverRetryDelay = 5 * time.Second
 )
 
 // pushoverKeyPattern は Pushover のアプリトークンとユーザキーの形。どちらも
@@ -59,6 +63,7 @@ type pushoverSink struct {
 	client      *http.Client
 	zone        *time.Location
 	queue       chan *event
+	retryDelay  time.Duration
 
 	// eewPeaks は GroupKey -> その地震について送った最大の予想震度。
 	// 送信goroutineだけが触るのでロックは要りません。
@@ -84,6 +89,7 @@ func newPushoverSink(credentials pushoverCredentials, client *http.Client, zone 
 		client:      client,
 		zone:        zone,
 		queue:       make(chan *event, queueDepth),
+		retryDelay:  pushoverRetryDelay,
 		eewPeaks:    map[string]eewPeak{},
 	}
 }
@@ -123,10 +129,11 @@ func (p *pushoverSink) deliver(ctx context.Context, e *event) {
 	}
 	if err := p.send(ctx, message); err != nil {
 		log.Printf("route=%s post failed code=%d: %v", p.route.Name, e.Code, err)
-		notifyFailures.Add(1)
+		pushoverFailures.Add(1)
 		return
 	}
-	notifySent.Add(1)
+	pushoverSent.Add(1)
+	p.rememberEEW(e)
 }
 
 // compose は送るべきイベントなら Pushover のメッセージを返します。
@@ -153,9 +160,8 @@ func (p *pushoverSink) compose(e *event) (pushoverMessage, bool) {
 func (p *pushoverSink) composeEEW(e *event, message eew) (pushoverMessage, bool) {
 	p.pruneEEWPeaks()
 
-	key := e.GroupKey
-	peak, sent := p.eewPeaks[key]
-	if key == "" {
+	peak, sent := p.eewPeaks[e.GroupKey]
+	if e.GroupKey == "" {
 		sent = false
 	}
 
@@ -170,17 +176,24 @@ func (p *pushoverSink) composeEEW(e *event, message eew) (pushoverMessage, bool)
 		return pushoverMessage{}, false
 	}
 
-	if key != "" {
-		scale := e.MaxScale
-		if sent {
-			scale = max(scale, peak.scale)
-		}
-		p.eewPeaks[key] = eewPeak{scale: scale, written: time.Now()}
-	}
-
 	composed := fromDiscordPayload(renderEEW(message, p.zone))
 	composed.Priority = priority
 	return composed, true
+}
+
+// rememberEEW は Pushover が受け付けた緊急地震速報の予想震度を覚えます。送信前に
+// 覚えると、第1報の送信に失敗した地震で、同じ震度の続報まで「送信済み」として
+// 抑止され、スマホが一度も鳴らないまま終わります。
+func (p *pushoverSink) rememberEEW(e *event) {
+	message, ok := e.Payload.(eew)
+	if !ok || message.Cancelled || e.GroupKey == "" {
+		return
+	}
+	scale := e.MaxScale
+	if peak, sent := p.eewPeaks[e.GroupKey]; sent {
+		scale = max(scale, peak.scale)
+	}
+	p.eewPeaks[e.GroupKey] = eewPeak{scale: scale, written: time.Now()}
 }
 
 // composeTsunami は津波警報以上だけを優先度高にします。注意報と解除まで
@@ -240,8 +253,9 @@ func (p *pushoverSink) pruneEEWPeaks() {
 	}
 }
 
-// send は 429 とサーバエラーだけを再試行します。Pushover はそれ以外の 4xx を
-// 「何度送っても同じ」と明言していて、再送し続けるとアプリごと止められます。
+// send はサーバエラーと通信エラーだけを再試行します。4xx は「何度送っても同じ」と
+// Pushover が明言していて、再送し続けるとアプリごと止められます。429 も例外では
+// なく、月間の送信上限に達したという意味なので月が替わるまで通りません。
 func (p *pushoverSink) send(ctx context.Context, message pushoverMessage) error {
 	form := url.Values{}
 	form.Set("token", p.credentials.Token)
@@ -260,13 +274,13 @@ func (p *pushoverSink) send(ctx context.Context, message pushoverMessage) error 
 		lastErr = err
 
 		var status statusError
-		if errors.As(err, &status) && !status.retryable() {
+		if errors.As(err, &status) && status.code < http.StatusInternalServerError {
 			return err
 		}
 		if attempt == maxSendRetries-1 {
 			break
 		}
-		if err := sleep(ctx, time.Duration(math.Pow(2, float64(attempt)))*time.Second); err != nil {
+		if err := sleep(ctx, p.retryDelay*time.Duration(math.Pow(2, float64(attempt)))); err != nil {
 			return err
 		}
 	}

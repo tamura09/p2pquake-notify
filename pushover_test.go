@@ -61,35 +61,39 @@ func TestPushoverRouteTakesOnlyRealWarnings(t *testing.T) {
 }
 
 func TestPushoverSendsAnEarthquakeOnlyWhenItGetsWorse(t *testing.T) {
-	p := testPushoverSink()
+	recorder := &pushoverRecorder{}
+	p := recorder.sink(t, func(int, http.ResponseWriter) {})
 
-	steps := []struct {
-		name         string
-		e            *event
-		wantSent     bool
-		wantPriority int
-	}{
-		{"first report", eewEvent(t, "1", scale5Upper, false, false), true, pushoverPriorityHigh},
-		{"same forecast", eewEvent(t, "2", scale5Upper, false, false), false, 0},
-		{"stronger forecast", eewEvent(t, "3", scale6Lower, false, false), true, pushoverPriorityHigh},
-		{"weaker forecast", eewEvent(t, "4", scale5Upper, false, false), false, 0},
-		{"cancellation", eewEvent(t, "5", scale5Upper, true, false), true, pushoverPriorityNormal},
+	for _, e := range []*event{
+		eewEvent(t, "1", scale5Upper, false, false), // 最初の報
+		eewEvent(t, "2", scale5Upper, false, false), // 同じ予想
+		eewEvent(t, "3", scale6Lower, false, false), // 予想が上がった
+		eewEvent(t, "4", scale5Upper, false, false), // 予想が下がった
+		eewEvent(t, "5", scale5Upper, true, false),  // 取消
+	} {
+		p.deliver(context.Background(), e)
 	}
-	for _, step := range steps {
-		message, sent := p.compose(step.e)
-		if sent != step.wantSent {
-			t.Fatalf("%s: sent=%t, want %t", step.name, sent, step.wantSent)
-		}
-		if sent && message.Priority != step.wantPriority {
-			t.Errorf("%s: priority=%d, want %d", step.name, message.Priority, step.wantPriority)
-		}
+
+	got := recorder.priorities()
+	want := []string{"1", "1", "0"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("pushed priorities %v, want %v (first, raised, cancellation)", got, want)
 	}
 }
 
-func TestPushoverDoesNotSendACancellationNobodyWasWarnedAbout(t *testing.T) {
-	p := testPushoverSink()
-	if _, sent := p.compose(eewEvent(t, "1", scale5Upper, true, false)); sent {
-		t.Error("a cancellation for an unseen earthquake was sent")
+func TestPushoverRetriesAnEarthquakeWhosePushFailed(t *testing.T) {
+	recorder := &pushoverRecorder{}
+	p := recorder.sink(t, func(attempt int, w http.ResponseWriter) {
+		if attempt == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	p.deliver(context.Background(), eewEvent(t, "1", scale5Upper, false, false))
+	p.deliver(context.Background(), eewEvent(t, "2", scale5Upper, false, false))
+
+	if got := len(recorder.priorities()); got != 2 {
+		t.Errorf("made %d requests; the second report must be pushed because the first never got through", got)
 	}
 }
 
@@ -137,6 +141,25 @@ type pushoverRecorder struct {
 	requests []url.Values
 }
 
+// sink は記録用サーバへ送る pushoverSink を作ります。再試行の待ちは詰めます。
+func (r *pushoverRecorder) sink(t *testing.T, respond func(attempt int, w http.ResponseWriter)) *pushoverSink {
+	t.Helper()
+	p := testPushoverSink()
+	p.endpoint = r.server(t, respond).URL
+	p.retryDelay = time.Millisecond
+	return p
+}
+
+func (r *pushoverRecorder) priorities() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	got := make([]string, 0, len(r.requests))
+	for _, request := range r.requests {
+		got = append(got, request.Get("priority"))
+	}
+	return got
+}
+
 func (r *pushoverRecorder) server(t *testing.T, respond func(attempt int, w http.ResponseWriter)) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -153,10 +176,8 @@ func (r *pushoverRecorder) server(t *testing.T, respond func(attempt int, w http
 
 func TestPushoverSendPostsTheForm(t *testing.T) {
 	recorder := &pushoverRecorder{}
-	server := recorder.server(t, func(int, http.ResponseWriter) {})
+	p := recorder.sink(t, func(int, http.ResponseWriter) {})
 
-	p := testPushoverSink()
-	p.endpoint = server.URL
 	if err := p.send(context.Background(), pushoverMessage{Title: "t", Message: "m", Priority: pushoverPriorityHigh}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -170,38 +191,36 @@ func TestPushoverSendPostsTheForm(t *testing.T) {
 }
 
 func TestPushoverSendDoesNotRetryARejectedRequest(t *testing.T) {
-	recorder := &pushoverRecorder{}
-	server := recorder.server(t, func(_ int, w http.ResponseWriter) {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"user":"invalid","errors":["user identifier is invalid"],"status":0}`))
-	})
+	for _, code := range []int{http.StatusBadRequest, http.StatusTooManyRequests} {
+		recorder := &pushoverRecorder{}
+		p := recorder.sink(t, func(_ int, w http.ResponseWriter) {
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(`{"user":"invalid","errors":["user identifier is invalid"],"status":0}`))
+		})
 
-	p := testPushoverSink()
-	p.endpoint = server.URL
-	err := p.send(context.Background(), pushoverMessage{Title: "t", Message: "m"})
+		err := p.send(context.Background(), pushoverMessage{Title: "t", Message: "m"})
 
-	var status statusError
-	if !errors.As(err, &status) || status.code != http.StatusBadRequest {
-		t.Fatalf("err = %v, want a 400 statusError", err)
-	}
-	if !strings.Contains(err.Error(), "user identifier is invalid") {
-		t.Errorf("error does not carry Pushover's reason: %v", err)
-	}
-	if len(recorder.requests) != 1 {
-		t.Errorf("sent %d times; a 400 must not be retried", len(recorder.requests))
+		var status statusError
+		if !errors.As(err, &status) || status.code != code {
+			t.Fatalf("err = %v, want a %d statusError", err, code)
+		}
+		if !strings.Contains(err.Error(), "user identifier is invalid") {
+			t.Errorf("error does not carry Pushover's reason: %v", err)
+		}
+		if len(recorder.requests) != 1 {
+			t.Errorf("%d: sent %d times; it must not be retried", code, len(recorder.requests))
+		}
 	}
 }
 
 func TestPushoverSendRetriesServerErrors(t *testing.T) {
 	recorder := &pushoverRecorder{}
-	server := recorder.server(t, func(attempt int, w http.ResponseWriter) {
+	p := recorder.sink(t, func(attempt int, w http.ResponseWriter) {
 		if attempt == 0 {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 	})
 
-	p := testPushoverSink()
-	p.endpoint = server.URL
 	if err := p.send(context.Background(), pushoverMessage{Title: "t", Message: "m"}); err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -262,5 +281,12 @@ func TestFanOutHandsWarningsToPushover(t *testing.T) {
 
 	if got := len(receiver.pushover.queue); got != 1 {
 		t.Errorf("pushover queue holds %d events, want only the early warning", got)
+	}
+}
+
+func TestPushoverDoesNotSendACancellationNobodyWasWarnedAbout(t *testing.T) {
+	p := testPushoverSink()
+	if _, sent := p.compose(eewEvent(t, "1", scale5Upper, true, false)); sent {
+		t.Error("a cancellation for an unseen earthquake was sent")
 	}
 }
