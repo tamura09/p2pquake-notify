@@ -49,6 +49,9 @@ type ingest struct {
 	eewQuakes eewQuakes
 
 	sinks []*sink
+
+	// pushover は無効なら nil です。
+	pushover *pushoverSink
 }
 
 // run は接続が切れても諦めずに繋ぎ直し続けます。ctx がキャンセルされるまで戻りません。
@@ -189,6 +192,9 @@ func (i *ingest) fanOut(e *event) {
 		case i.isQuakeAfterEEW(s.route, e):
 			s.offer(e)
 		}
+	}
+	if i.pushover != nil && i.pushover.route.matches(e) {
+		i.pushover.offer(e)
 	}
 }
 
@@ -391,7 +397,7 @@ func (i *ingest) fetchHistory(ctx context.Context, code int) ([]json.RawMessage,
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, statusError{code: resp.StatusCode, body: string(body)}
+		return nil, statusError{service: "p2pquake", code: resp.StatusCode, body: string(body)}
 	}
 
 	var messages []json.RawMessage

@@ -156,7 +156,7 @@ func (p *metricsPusher) remoteWrite(ctx context.Context, series []prompb.TimeSer
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return statusError{code: resp.StatusCode, body: string(body)}
+		return statusError{service: "grafana", code: resp.StatusCode, body: string(body)}
 	}
 	return nil
 }

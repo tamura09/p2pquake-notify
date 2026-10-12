@@ -267,10 +267,10 @@ func (s *sink) attempt(ctx context.Context, method, url string, body []byte) ([]
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, retryAfterDuration(resp, responseBody), statusError{code: resp.StatusCode, body: string(responseBody)}
+		return nil, retryAfterDuration(resp, responseBody), statusError{service: "discord", code: resp.StatusCode, body: string(responseBody)}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, 0, statusError{code: resp.StatusCode, body: string(responseBody)}
+		return nil, 0, statusError{service: "discord", code: resp.StatusCode, body: string(responseBody)}
 	}
 	return responseBody, 0, nil
 }
@@ -294,12 +294,13 @@ func retryAfterDuration(resp *http.Response, body []byte) time.Duration {
 }
 
 type statusError struct {
-	code int
-	body string
+	service string
+	code    int
+	body    string
 }
 
 func (e statusError) Error() string {
-	return fmt.Sprintf("discord returned %d: %s", e.code, truncate(e.body, 500))
+	return fmt.Sprintf("%s returned %d: %s", e.service, e.code, truncate(e.body, 500))
 }
 
 // retryable は再試行する価値があるかどうか。400番台のうち 429 以外は

@@ -34,6 +34,20 @@
 
 覚えているのはメモリ上だけなので、**速報の後にタスクが再起動すると、その地震の地震情報は `alert` に出ません**。
 
+## 緊急のものはPushoverでもスマホを鳴らします
+
+Discordの3ルートとは別に、緊急地震速報 (556) と津波予報 (552) を [Pushover](https://pushover.net/) へ送ります（[pushover.go](pushover.go)）。全国が対象で、訓練報は送りません。地震情報 (551) は「もう揺れた後」の記録なので送りません。
+
+Pushoverは送ったものを書き換えられないため、1つの地震で10報以上届く緊急地震速報は次の報だけに絞ります。予想地域だけが広がった続報は送りません（Discord側で追えます）。
+
+- その地震の最初の報 — 優先度 1（おやすみモードを無視して鳴る）
+- 予想最大震度がそれまでに送ったものより上がった報 — 優先度 1
+- 送ったことのある地震の取消報 — 優先度 0
+
+津波予報は、大津波警報・津波警報を優先度 1、津波注意報と解除を優先度 0 にしています。注意報や解除まで夜中に鳴らすと、本当に逃げるべき時に慣れで無視されるためです。優先度 2（確認するまで鳴り続ける）は使っていません。
+
+トークンとユーザキーは読めなくても起動を止めません。Pushoverは追加の経路で、SSMに値を入れ忘れただけで地震の通知が全部止まるのは本末転倒だからです。読めない時は起動時に `pushover: disabled: ...` を1行出して無効になります。
+
 ## 同じ地震の続報は1通にまとめます
 
 気象庁は1回の地震について、分かった順に何度も発表します。都度投稿すると同じ地震で通知が並ぶので、**最初のメッセージを書き換えます**。
@@ -98,6 +112,8 @@
 | `P2PQUAKE_LOCAL_WEBHOOK_PARAMETER_NAME` | (なし) | 地域用webhook URLのSSM SecureString名 |
 | `P2PQUAKE_LOCAL_PREFECTURES` | `岩手県` | 地域ルートの対象。カンマ区切り。部分一致で判定します |
 | `P2PQUAKE_LOCAL_MIN_SCALE` | `-1` (しきい値なし) | 地域ルートの最小震度。`30`=震度3、`45`=震度5弱 |
+| `P2PQUAKE_PUSHOVER_TOKEN_PARAMETER_NAME` | (なし) | PushoverのアプリトークンのSSM SecureString名。ユーザキーと両方未設定ならPushoverは無効 |
+| `P2PQUAKE_PUSHOVER_USER_PARAMETER_NAME` | (なし) | Pushoverのユーザキー (またはグループキー) のSSM SecureString名 |
 | `P2PQUAKE_WS_URL` | `wss://api.p2pquake.net/v2/ws` | 接続先。サンドボックスへの切り替えに使います |
 | `P2PQUAKE_HISTORY_URL` | `https://api.p2pquake.net/v2/history` | 再接続時のギャップ補完に読むREST |
 | `P2PQUAKE_BACKFILL_LIMIT` | `20` | 補完で読み直す件数（**code 1つあたり**）。`0`で補完しない |

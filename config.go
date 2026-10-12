@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strconv"
@@ -29,6 +30,10 @@ type config struct {
 	WebSocketURL string
 	HistoryURL   string
 	Routes       []route
+
+	// Pushover は緊急地震速報と津波予報をスマホへ直接鳴らす送り先。
+	// 未設定・読めない場合は nil で、Discordのルートだけで動きます。
+	Pushover *pushoverCredentials
 
 	// Zone は上流の時刻表記を解釈するタイムゾーン。P2P地震情報はJST固定です。
 	Zone *time.Location
@@ -144,7 +149,54 @@ func loadConfig(ctx context.Context, resolver parameterResolver) (config, error)
 		return config{}, errors.New("no routes configured: set at least one of P2PQUAKE_{DEV,ALERT,LOCAL}_WEBHOOK_PARAMETER_NAME")
 	}
 
+	cfg.Pushover = loadPushoverCredentials(ctx, resolver)
+
 	return cfg, nil
+}
+
+// loadPushoverCredentials は Pushover のトークンとユーザキーを SSM から読みます。
+//
+// webhook と違い、読めなくても起動を止めません。Pushover は Discord への通知に
+// 足す2本目の経路で、ここで落とすと、SSMの値を入れ忘れただけで地震の通知が
+// 全部止まります。読めない時はログを1行残して無効にします。
+func loadPushoverCredentials(ctx context.Context, resolver parameterResolver) *pushoverCredentials {
+	tokenParameter := strings.TrimSpace(os.Getenv("P2PQUAKE_PUSHOVER_TOKEN_PARAMETER_NAME"))
+	userParameter := strings.TrimSpace(os.Getenv("P2PQUAKE_PUSHOVER_USER_PARAMETER_NAME"))
+	if tokenParameter == "" && userParameter == "" {
+		return nil
+	}
+
+	credentials, err := readPushoverCredentials(ctx, resolver, tokenParameter, userParameter)
+	if err != nil {
+		log.Printf("pushover: disabled: %v", err)
+		return nil
+	}
+	return credentials
+}
+
+func readPushoverCredentials(ctx context.Context, resolver parameterResolver, tokenParameter, userParameter string) (*pushoverCredentials, error) {
+	if tokenParameter == "" || userParameter == "" {
+		return nil, errors.New("P2PQUAKE_PUSHOVER_TOKEN_PARAMETER_NAME and P2PQUAKE_PUSHOVER_USER_PARAMETER_NAME must both be set")
+	}
+
+	token, err := resolver.parameterString(ctx, tokenParameter)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", tokenParameter, err)
+	}
+	user, err := resolver.parameterString(ctx, userParameter)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", userParameter, err)
+	}
+
+	token, user = strings.TrimSpace(token), strings.TrimSpace(user)
+	// 値そのものはログに出しません。プレースホルダのままかどうかが分かれば足ります。
+	if !pushoverKeyPattern.MatchString(token) {
+		return nil, fmt.Errorf("%s is not a Pushover application token (30 alphanumerics)", tokenParameter)
+	}
+	if !pushoverKeyPattern.MatchString(user) {
+		return nil, fmt.Errorf("%s is not a Pushover user or group key (30 alphanumerics)", userParameter)
+	}
+	return &pushoverCredentials{Token: token, User: user}, nil
 }
 
 // validateWebhookURL は Discord の webhook URL であることを確認します。
