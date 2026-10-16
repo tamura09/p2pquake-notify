@@ -209,7 +209,7 @@ func validateWebhookURL(raw string) (string, error) {
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("parse webhook URL: %w", err)
+		return "", fmt.Errorf("parse webhook URL: %w", withoutURL(err))
 	}
 	if parsed.Scheme != "https" {
 		return "", fmt.Errorf("webhook URL must be https, got %q", parsed.Scheme)

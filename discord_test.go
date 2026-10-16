@@ -196,6 +196,30 @@ func TestRateLimitedRequestIsRetried(t *testing.T) {
 	}
 }
 
+func TestTransportErrorKeepsTheURLOut(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	s := testSink(t, server.URL+"/api/webhooks/1/secret-token")
+	server.Close()
+
+	_, _, err := s.attempt(context.Background(), http.MethodPost, s.route.WebhookURL, []byte("{}"))
+	if err == nil {
+		t.Fatal("attempt succeeded against a closed server")
+	}
+	if strings.Contains(err.Error(), "secret-token") {
+		t.Errorf("error %q contains the webhook token", err)
+	}
+}
+
+func TestUnparsableWebhookURLKeepsTheURLOut(t *testing.T) {
+	_, err := validateWebhookURL("https://discord.com/api/webhooks/1/secret-token%zz")
+	if err == nil {
+		t.Fatal("an unparsable URL was accepted")
+	}
+	if strings.Contains(err.Error(), "secret-token") {
+		t.Errorf("error %q contains the webhook token", err)
+	}
+}
+
 // 400 はペイロードかURLが悪いので、投げ直しても結果は変わりません。
 // 再試行するとレート制限を無駄に消費します。
 func TestBadRequestIsNotRetried(t *testing.T) {
