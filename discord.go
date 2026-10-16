@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 )
@@ -249,13 +250,13 @@ func (s *sink) attempt(ctx context.Context, method, url string, body []byte) ([]
 
 	req, err := http.NewRequestWithContext(requestCtx, method, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, withoutURL(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, withoutURL(err)
 	}
 	defer resp.Body.Close()
 
@@ -273,6 +274,17 @@ func (s *sink) attempt(ctx context.Context, method, url string, body []byte) ([]
 		return nil, 0, statusError{service: "discord", code: resp.StatusCode, body: string(responseBody)}
 	}
 	return responseBody, 0, nil
+}
+
+// withoutURL は net/http と net/url がエラーに入れる URL を取り除きます。
+// webhook の URL はパスにトークンを含むので、そのままだとログに認証情報が
+// 残ります。
+func withoutURL(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("%s webhook: %w", urlErr.Op, urlErr.Err)
+	}
+	return err
 }
 
 // retryAfterDuration は 429 応答から待ち時間を読みます。Discordは本文のJSONと
