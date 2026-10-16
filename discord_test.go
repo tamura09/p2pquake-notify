@@ -196,8 +196,6 @@ func TestRateLimitedRequestIsRetried(t *testing.T) {
 	}
 }
 
-// 400 はペイロードかURLが悪いので、投げ直しても結果は変わりません。
-// 再試行するとレート制限を無駄に消費します。
 func TestTransportErrorKeepsTheURLOut(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	s := testSink(t, server.URL+"/api/webhooks/1/secret-token")
@@ -222,6 +220,8 @@ func TestUnparsableWebhookURLKeepsTheURLOut(t *testing.T) {
 	}
 }
 
+// 400 はペイロードかURLが悪いので、投げ直しても結果は変わりません。
+// 再試行するとレート制限を無駄に消費します。
 func TestBadRequestIsNotRetried(t *testing.T) {
 	server := newRecordingServer(t, func(attempt int, w http.ResponseWriter) {
 		w.WriteHeader(http.StatusBadRequest)
