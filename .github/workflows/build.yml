@@ -28,7 +28,7 @@ env:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04-arm
     defaults:
       run:
         shell: bash
@@ -61,7 +61,7 @@ jobs:
     # 使うことになります。このジョブが assume するロールは ECR の p2pquake-notify
     # リポジトリと、ECS の同名サービスへの UpdateService だけに絞られています。
     if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04-arm
     defaults:
       run:
         shell: bash
@@ -80,8 +80,8 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
 
-      # QEMU も buildx のマルチプラットフォーム設定も要りません。Dockerfile が
-      # ランナー上でクロスコンパイルし、arm64 の層はバイナリのコピーだけだからです。
+      # QEMU も buildx のマルチプラットフォーム設定も要りません。ランナーも
+      # ターゲットも arm64 なので、Dockerfile のビルドはネイティブで済みます。
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
