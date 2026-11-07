@@ -24,8 +24,12 @@ type route struct {
 	// 長い名前で来るためで、"青森県" の指定でこれを拾えるようにしています。
 	Prefectures []string
 
-	// IncludeTest は訓練報・テスト配信を通すか。dev以外では必ず false です。
+	// IncludeTest は訓練報・テスト配信を通すか。Discord では dev 以外は必ず false です。
 	// 訓練報を本番の通知先に流すと、いざという時に誰も信じなくなります。
+	//
+	// 例外は LINE のルート(lineRoute)で、true ですが届け先はテスト用グループだけです。
+	// 訓練報を本番のグループから守っているのは lineSink.recipients の振り分けなので、
+	// そこを変える時はこのことを忘れないでください。
 	IncludeTest bool
 
 	// QuakeAfterEEW が true なら、このルートが緊急地震速報(556)を流した地震に

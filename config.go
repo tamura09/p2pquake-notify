@@ -35,6 +35,13 @@ type config struct {
 	// 未設定・読めない場合は nil で、Discordのルートだけで動きます。
 	Pushover *pushoverCredentials
 
+	// Line は Discord の alert ルートと同じものを LINE へ送る送り先。
+	// 未設定・読めない場合は nil で、他の送り先だけで動きます。
+	Line *lineCredentials
+
+	// LineGroupsTable は送り先のグループを引く DynamoDB テーブル。
+	LineGroupsTable string
+
 	// Zone は上流の時刻表記を解釈するタイムゾーン。P2P地震情報はJST固定です。
 	Zone *time.Location
 
@@ -150,6 +157,14 @@ func loadConfig(ctx context.Context, resolver parameterResolver) (config, error)
 	}
 
 	cfg.Pushover = loadPushoverCredentials(ctx, resolver)
+	cfg.Line, cfg.LineGroupsTable = loadLineCredentials(ctx, resolver)
+	if cfg.Line != nil && cfg.WebSocketURL != defaultWebSocketURL {
+		// 本番の上流以外(サンドボックス・ローカルのモック)はダミーの地震を流すので、
+		// 本番のグループへは送りません。サンドボックスかどうかを URL で当てに
+		// いくと、末尾のスラッシュやクエリひとつで判定を外し、ダミーの緊急地震速報が
+		// 全グループへ届きます。本番の URL と完全に一致する時だけを本番とみなします。
+		cfg.Line.TestOnly = true
+	}
 
 	return cfg, nil
 }
@@ -197,6 +212,62 @@ func readPushoverCredentials(ctx context.Context, resolver parameterResolver, to
 		return nil, fmt.Errorf("%s is not a Pushover user or group key (30 alphanumerics)", userParameter)
 	}
 	return &pushoverCredentials{Token: token, User: user}, nil
+}
+
+// loadLineCredentials は LINE のチャネルアクセストークンとテスト用グループを SSM から読みます。
+//
+// 公式アカウントも送り先も line-charge-reminder と同じです。トークンとテスト用グループは
+// そのSSMパラメータを、参加中のグループはその DynamoDB テーブルを読みます。
+//
+// Pushover と同じく、読めなくても起動を止めません。LINE は追加の経路で、ここで落とすと
+// 設定の誤りひとつで地震の通知が全部止まります。テスト用グループだけが読めない時は、
+// 本番への送信は続けてテスト配信だけを無効にします。
+func loadLineCredentials(ctx context.Context, resolver parameterResolver) (*lineCredentials, string) {
+	tokenParameter := strings.TrimSpace(os.Getenv("P2PQUAKE_LINE_TOKEN_PARAMETER_NAME"))
+	table := strings.TrimSpace(os.Getenv("P2PQUAKE_LINE_GROUPS_TABLE"))
+	testParameter := strings.TrimSpace(os.Getenv("P2PQUAKE_LINE_TEST_GROUP_PARAMETER_NAME"))
+	if tokenParameter == "" && table == "" && testParameter == "" {
+		return nil, ""
+	}
+
+	credentials, err := readLineCredentials(ctx, resolver, tokenParameter, table, testParameter)
+	if err != nil {
+		log.Printf("line: disabled: %v", err)
+		return nil, ""
+	}
+	return credentials, table
+}
+
+func readLineCredentials(ctx context.Context, resolver parameterResolver, tokenParameter, table, testParameter string) (*lineCredentials, error) {
+	if tokenParameter == "" || table == "" {
+		return nil, errors.New("P2PQUAKE_LINE_TOKEN_PARAMETER_NAME and P2PQUAKE_LINE_GROUPS_TABLE must both be set")
+	}
+
+	token, err := resolver.parameterString(ctx, tokenParameter)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", tokenParameter, err)
+	}
+	// 値そのものはログに出しません。プレースホルダのままかどうかが分かれば足ります。
+	token = strings.TrimSpace(token)
+	if token == "" || token == "MANAGED_OUTSIDE_TERRAFORM" || strings.ContainsAny(token, " \t\r\n") {
+		return nil, fmt.Errorf("%s is not a LINE channel access token", tokenParameter)
+	}
+
+	credentials := &lineCredentials{Token: token}
+	if testParameter == "" {
+		log.Printf("line: test group disabled: P2PQUAKE_LINE_TEST_GROUP_PARAMETER_NAME is not set")
+		return credentials, nil
+	}
+	group, err := resolver.parameterString(ctx, testParameter)
+	if err == nil && !lineGroupPattern.MatchString(strings.TrimSpace(group)) {
+		err = errors.New("not a LINE group ID")
+	}
+	if err != nil {
+		log.Printf("line: test group disabled: %s: %v", testParameter, err)
+		return credentials, nil
+	}
+	credentials.TestGroup = strings.TrimSpace(group)
+	return credentials, nil
 }
 
 // validateWebhookURL は Discord の webhook URL であることを確認します。

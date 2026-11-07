@@ -19,6 +19,7 @@ import (
 	_ "time/tzdata"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
@@ -81,6 +82,20 @@ func main() {
 		log.Printf("route configured: %s", pushover.route)
 	}
 
+	var line *lineSink
+	if cfg.Line != nil {
+		groups := dynamoLineGroups{client: dynamodb.NewFromConfig(awsConfig), table: cfg.LineGroupsTable}
+		line = newLineSink(*cfg.Line, groups, apiClient, cfg.Zone)
+		// 参加中のグループを先に読んでおきます。以後は1分ごとに読み直し、送る時は
+		// 手元の一覧を使うので、地震の最中にテーブルを待つことはありません。
+		active, err := line.refreshGroups(ctx)
+		if err != nil {
+			log.Printf("line: %v (will retry in the background and on the first notification)", err)
+		}
+		log.Printf("route configured: %s groups=%d testGroup=%t testOnly=%t",
+			line.route, len(active), cfg.Line.TestGroup != "", cfg.Line.TestOnly)
+	}
+
 	// Discordへの接続を先に温めておきます。最初の1通が緊急地震速報だった場合、
 	// そこでDNS解決とTLSハンドシェイクから始めると通知が数百ミリ秒遅れます。
 	// 平常時に済ませられる仕事を、一番急いでいる瞬間に持ち込まないための準備です。
@@ -102,6 +117,7 @@ func main() {
 		dedup:     newDedupCache(dedupTTL, dedupMaxSize),
 		sinks:     sinks,
 		pushover:  pushover,
+		line:      line,
 	}
 
 	var wg sync.WaitGroup
@@ -113,6 +129,11 @@ func main() {
 	if pushover != nil {
 		wg.Go(func() {
 			pushover.run(ctx)
+		})
+	}
+	if line != nil {
+		wg.Go(func() {
+			line.run(ctx)
 		})
 	}
 	wg.Go(func() {
