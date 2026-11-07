@@ -1,6 +1,6 @@
 # p2pquake-notify
 
-[P2P地震情報](https://www.p2pquake.net/) のJSON API v2 (WebSocket) に常時接続し、緊急地震速報・津波予報・地震情報を3系統のDiscord webhookへ振り分ける常駐サービスです。AWSリソースは [tamura09/aws-terraform](https://github.com/tamura09/aws-terraform) が所有し、このリポジトリはソースとイメージのビルド/デプロイだけを持ちます。
+[P2P地震情報](https://www.p2pquake.net/) のJSON API v2 (WebSocket) に常時接続し、緊急地震速報・津波予報・地震情報を3系統のDiscord webhookへ振り分け、急ぐものはPushoverとLINEにも送る常駐サービスです。AWSリソースは [tamura09/aws-terraform](https://github.com/tamura09/aws-terraform) が所有し、このリポジトリはソースとイメージのビルド/デプロイだけを持ちます。
 
 ## なぜECS Fargateなのか
 
@@ -51,6 +51,24 @@ Pushoverは送ったものを書き換えられないため、1つの地震で10
 再試行するのは5xxと通信エラーだけで、間隔は5秒から倍々にします（Pushoverの指定が最低5秒）。429は月間の送信上限に達したという意味で、月が替わるまで何度送っても通らないため再試行しません。
 
 トークンとユーザキーは読めなくても起動を止めません。Pushoverは追加の経路で、SSMに値を入れ忘れただけで地震の通知が全部止まるのは本末転倒だからです。読めない時は起動時に `pushover: disabled: ...` を1行出して無効になります。
+
+## 速報チャンネルと同じものをLINEにも送ります
+
+Discordの `alert` と同じもの — 緊急地震速報 (556)・津波予報 (552)・速報を流した地震の地震情報 (551) — を、LINE公式アカウントのプッシュメッセージでも送ります（[line.go](line.go)）。全国が対象で、訓練報は送りません。
+
+LINEも送ったものを書き換えられず、無料枠の月間送信数が限られています（**グループ宛ては人数ぶん数えられます**）。Discordのように全報を流すと1つの地震で十数通になるので、送る報を絞ります。
+
+| code | 送る報 |
+| --- | --- |
+| 556 | Pushoverと同じ。最初の報、予想最大震度が上がった報、送ったことのある地震の取消報 |
+| 552 | 全報（めったに出ず、1報ごとに状況が変わるため） |
+| 551 | 最初の報（多くは震度速報）、最初の「各地の震度に関する情報」、最大震度が上がった報 |
+
+551 の「震源に関する情報」は単独では送りませんが、Discordと同じく積み上げて次に送る報の震源として載せます。1つの地震でふつう速報2〜3通と地震情報2通です。「送った」と数えるのはLINEが受け付けた報だけで、失敗した報の次の報は改めて送ります。
+
+再試行は5xxと通信エラーだけで、同じ `X-Line-Retry-Key` を使います（応答を受け取れなかっただけで受け付けられていた場合に二重に届かないため）。429は月間の上限到達のことが多いので再試行しません。
+
+送り先は `/p2pquake-notify/line/to` に、ユーザID (`U…`)・グループID (`C…`)・トークルームID (`R…`) をカンマか改行区切りで入れます。トークンと送り先が読めない・プレースホルダのままでも起動は止めず、`line: disabled: ...` を1行出して無効になります（Pushoverと同じ理由）。
 
 ## 同じ地震の続報は1通にまとめます
 
@@ -118,6 +136,8 @@ Pushoverは送ったものを書き換えられないため、1つの地震で10
 | `P2PQUAKE_LOCAL_MIN_SCALE` | `-1` (しきい値なし) | 地域ルートの最小震度。`30`=震度3、`45`=震度5弱 |
 | `P2PQUAKE_PUSHOVER_TOKEN_PARAMETER_NAME` | (なし) | PushoverのアプリトークンのSSM SecureString名。ユーザキーと両方未設定ならPushoverは無効 |
 | `P2PQUAKE_PUSHOVER_USER_PARAMETER_NAME` | (なし) | Pushoverのユーザキー (またはグループキー) のSSM SecureString名 |
+| `P2PQUAKE_LINE_TOKEN_PARAMETER_NAME` | (なし) | LINEのチャネルアクセストークン (長期) のSSM SecureString名。送り先と両方未設定ならLINEは無効 |
+| `P2PQUAKE_LINE_TO_PARAMETER_NAME` | (なし) | LINEの送り先ID (カンマ・改行区切りで複数可) のSSM SecureString名 |
 | `P2PQUAKE_WS_URL` | `wss://api.p2pquake.net/v2/ws` | 接続先。サンドボックスへの切り替えに使います |
 | `P2PQUAKE_HISTORY_URL` | `https://api.p2pquake.net/v2/history` | 再接続時のギャップ補完に読むREST |
 | `P2PQUAKE_BACKFILL_LIMIT` | `20` | 補完で読み直す件数（**code 1つあたり**）。`0`で補完しない |
@@ -144,6 +164,8 @@ Grafana Cloudへ毎分押し込む `p2pquake_last_message_age_seconds` を見て
 | `p2pquake_notification_failures_total` | Discordへの送信に最終的に失敗した件数 |
 | `p2pquake_pushover_failures_total` | Pushoverへの送信に最終的に失敗した件数。Discordとは別に数えます |
 | `p2pquake_pushover_sent_total` | Pushoverへ送った件数 |
+| `p2pquake_line_failures_total` | LINEへの送信に最終的に失敗した件数 |
+| `p2pquake_line_sent_total` | LINEへ送った件数 |
 | `p2pquake_messages_received_total` | 受信メッセージの累計 |
 | `p2pquake_duplicates_dropped_total` | 重複排除で落とした件数 |
 | `p2pquake_decode_failures_total` | デコードできなかった件数。増えたら上流の形式変更を疑う |

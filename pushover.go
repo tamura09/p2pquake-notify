@@ -65,14 +65,8 @@ type pushoverSink struct {
 	queue       chan *event
 	retryDelay  time.Duration
 
-	// eewPeaks は GroupKey -> その地震について送った最大の予想震度。
-	// 送信goroutineだけが触るのでロックは要りません。
-	eewPeaks map[string]eewPeak
-}
-
-type eewPeak struct {
-	scale   int
-	written time.Time
+	// eews は緊急地震速報のどの報を送るかを決めます(throttle.go)。
+	eews eewThrottle
 }
 
 type pushoverMessage struct {
@@ -90,7 +84,7 @@ func newPushoverSink(credentials pushoverCredentials, client *http.Client, zone 
 		zone:        zone,
 		queue:       make(chan *event, queueDepth),
 		retryDelay:  pushoverRetryDelay,
-		eewPeaks:    map[string]eewPeak{},
+		eews:        newEEWThrottle(),
 	}
 }
 
@@ -133,19 +127,13 @@ func (p *pushoverSink) deliver(ctx context.Context, e *event) {
 		return
 	}
 	pushoverSent.Add(1)
-	p.rememberEEW(e)
+	p.eews.remember(e)
 }
 
 // compose は送るべきイベントなら Pushover のメッセージを返します。
 //
-// Pushover は送ったものを書き換えられません。緊急地震速報は1つの地震で10報以上
-// 届くので、全報を送るとスマホが鳴り続けます。そこで送るのは
-//
-//   - その地震の最初の報
-//   - 予想最大震度が、それまでに送ったものより上がった報
-//   - 送ったことのある地震の取消報
-//
-// に絞ります。続報で予想地域だけが広がった場合は送りません(Discord 側は書き換えで追えます)。
+// Pushover は送ったものを書き換えられないので、緊急地震速報は eewThrottle で
+// 送る報を絞ります。
 func (p *pushoverSink) compose(e *event) (pushoverMessage, bool) {
 	switch payload := e.Payload.(type) {
 	case eew:
@@ -158,42 +146,16 @@ func (p *pushoverSink) compose(e *event) (pushoverMessage, bool) {
 }
 
 func (p *pushoverSink) composeEEW(e *event, message eew) (pushoverMessage, bool) {
-	p.pruneEEWPeaks()
-
-	peak, sent := p.eewPeaks[e.GroupKey]
-	if e.GroupKey == "" {
-		sent = false
-	}
-
-	priority := pushoverPriorityHigh
-	switch {
-	case message.Cancelled:
-		if !sent {
-			return pushoverMessage{}, false
-		}
-		priority = pushoverPriorityNormal
-	case sent && e.MaxScale <= peak.scale:
+	if !p.eews.allow(e, message) {
 		return pushoverMessage{}, false
 	}
 
 	composed := fromDiscordPayload(renderEEW(message, p.zone))
-	composed.Priority = priority
+	composed.Priority = pushoverPriorityHigh
+	if message.Cancelled {
+		composed.Priority = pushoverPriorityNormal
+	}
 	return composed, true
-}
-
-// rememberEEW は Pushover が受け付けた緊急地震速報の予想震度を覚えます。送信前に
-// 覚えると、第1報の送信に失敗した地震で、同じ震度の続報まで「送信済み」として
-// 抑止され、スマホが一度も鳴らないまま終わります。
-func (p *pushoverSink) rememberEEW(e *event) {
-	message, ok := e.Payload.(eew)
-	if !ok || message.Cancelled || e.GroupKey == "" {
-		return
-	}
-	scale := e.MaxScale
-	if peak, sent := p.eewPeaks[e.GroupKey]; sent {
-		scale = max(scale, peak.scale)
-	}
-	p.eewPeaks[e.GroupKey] = eewPeak{scale: scale, written: time.Now()}
 }
 
 // composeTsunami は津波警報以上だけを優先度高にします。注意報と解除まで
@@ -242,14 +204,6 @@ func fromDiscordPayload(payload discordWebhookPayload) pushoverMessage {
 	return pushoverMessage{
 		Title:   embed.Title,
 		Message: strings.Join(lines, "\n"),
-	}
-}
-
-func (p *pushoverSink) pruneEEWPeaks() {
-	for key, peak := range p.eewPeaks {
-		if time.Since(peak.written) > groupTTL {
-			delete(p.eewPeaks, key)
-		}
 	}
 }
 

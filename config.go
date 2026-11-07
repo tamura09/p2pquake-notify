@@ -35,6 +35,10 @@ type config struct {
 	// 未設定・読めない場合は nil で、Discordのルートだけで動きます。
 	Pushover *pushoverCredentials
 
+	// Line は Discord の alert ルートと同じものを LINE へ送る送り先。
+	// 未設定・読めない場合は nil で、他の送り先だけで動きます。
+	Line *lineCredentials
+
 	// Zone は上流の時刻表記を解釈するタイムゾーン。P2P地震情報はJST固定です。
 	Zone *time.Location
 
@@ -150,6 +154,7 @@ func loadConfig(ctx context.Context, resolver parameterResolver) (config, error)
 	}
 
 	cfg.Pushover = loadPushoverCredentials(ctx, resolver)
+	cfg.Line = loadLineCredentials(ctx, resolver)
 
 	return cfg, nil
 }
@@ -197,6 +202,51 @@ func readPushoverCredentials(ctx context.Context, resolver parameterResolver, to
 		return nil, fmt.Errorf("%s is not a Pushover user or group key (30 alphanumerics)", userParameter)
 	}
 	return &pushoverCredentials{Token: token, User: user}, nil
+}
+
+// loadLineCredentials は LINE のチャネルアクセストークンと送り先を SSM から読みます。
+//
+// Pushover と同じく、読めなくても起動を止めません。LINE は追加の経路で、SSMに値を
+// 入れ忘れただけで地震の通知が全部止まるのは本末転倒です。
+func loadLineCredentials(ctx context.Context, resolver parameterResolver) *lineCredentials {
+	tokenParameter := strings.TrimSpace(os.Getenv("P2PQUAKE_LINE_TOKEN_PARAMETER_NAME"))
+	toParameter := strings.TrimSpace(os.Getenv("P2PQUAKE_LINE_TO_PARAMETER_NAME"))
+	if tokenParameter == "" && toParameter == "" {
+		return nil
+	}
+
+	credentials, err := readLineCredentials(ctx, resolver, tokenParameter, toParameter)
+	if err != nil {
+		log.Printf("line: disabled: %v", err)
+		return nil
+	}
+	return credentials
+}
+
+func readLineCredentials(ctx context.Context, resolver parameterResolver, tokenParameter, toParameter string) (*lineCredentials, error) {
+	if tokenParameter == "" || toParameter == "" {
+		return nil, errors.New("P2PQUAKE_LINE_TOKEN_PARAMETER_NAME and P2PQUAKE_LINE_TO_PARAMETER_NAME must both be set")
+	}
+
+	token, err := resolver.parameterString(ctx, tokenParameter)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", tokenParameter, err)
+	}
+	to, err := resolver.parameterString(ctx, toParameter)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", toParameter, err)
+	}
+
+	// 値そのものはログに出しません。プレースホルダのままかどうかが分かれば足ります。
+	token = strings.TrimSpace(token)
+	if token == "" || token == "MANAGED_OUTSIDE_TERRAFORM" || strings.ContainsAny(token, " \t\r\n") {
+		return nil, fmt.Errorf("%s is not a LINE channel access token", tokenParameter)
+	}
+	recipients, err := parseLineRecipients(to)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", toParameter, err)
+	}
+	return &lineCredentials{Token: token, Recipients: recipients}, nil
 }
 
 // validateWebhookURL は Discord の webhook URL であることを確認します。

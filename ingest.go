@@ -52,6 +52,9 @@ type ingest struct {
 
 	// pushover は無効なら nil です。
 	pushover *pushoverSink
+
+	// line は無効なら nil です。
+	line *lineSink
 }
 
 // run は接続が切れても諦めずに繋ぎ直し続けます。ctx がキャンセルされるまで戻りません。
@@ -185,17 +188,29 @@ func (i *ingest) dispatch(e *event) {
 // 揺れたのかを同じチャンネルで見せないと話が途中で終わります。
 func (i *ingest) fanOut(e *event) {
 	for _, s := range i.sinks {
-		switch {
-		case s.route.matches(e):
-			i.rememberEEWQuake(s.route, e)
-			s.offer(e)
-		case i.isQuakeAfterEEW(s.route, e):
+		if i.accepts(s.route, e) {
 			s.offer(e)
 		}
 	}
 	if i.pushover != nil && i.pushover.route.matches(e) {
 		i.pushover.offer(e)
 	}
+	if i.line != nil && i.accepts(i.line.route, e) {
+		i.line.offer(e)
+	}
+}
+
+// accepts はこのルートへ e を渡すべきかを返します。緊急地震速報を通した場合は、
+// あとの地震情報と突き合わせるためにその発生時刻を覚えます。
+func (i *ingest) accepts(r route, e *event) bool {
+	switch {
+	case r.matches(e):
+		i.rememberEEWQuake(r, e)
+		return true
+	case i.isQuakeAfterEEW(r, e):
+		return true
+	}
+	return false
 }
 
 // rememberEEWQuake は、緊急地震速報を流したルートについて、その地震の発生時刻を

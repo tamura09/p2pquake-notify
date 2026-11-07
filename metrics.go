@@ -31,6 +31,8 @@ var (
 	notifyFailures    atomic.Int64
 	pushoverSent      atomic.Int64
 	pushoverFailures  atomic.Int64
+	lineSent          atomic.Int64
+	lineFailures      atomic.Int64
 	wsReconnects      atomic.Int64
 	backfilledEvents  atomic.Int64
 
@@ -110,6 +112,8 @@ func buildTimeSeries(now time.Time, started time.Time) []prompb.TimeSeries {
 		gauge("p2pquake_notification_failures_total", base, float64(notifyFailures.Load()), timestamp),
 		gauge("p2pquake_pushover_sent_total", base, float64(pushoverSent.Load()), timestamp),
 		gauge("p2pquake_pushover_failures_total", base, float64(pushoverFailures.Load()), timestamp),
+		gauge("p2pquake_line_sent_total", base, float64(lineSent.Load()), timestamp),
+		gauge("p2pquake_line_failures_total", base, float64(lineFailures.Load()), timestamp),
 		gauge("p2pquake_ws_reconnects_total", base, float64(wsReconnects.Load()), timestamp),
 		gauge("p2pquake_backfilled_events_total", base, float64(backfilledEvents.Load()), timestamp),
 	}

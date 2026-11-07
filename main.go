@@ -81,6 +81,12 @@ func main() {
 		log.Printf("route configured: %s", pushover.route)
 	}
 
+	var line *lineSink
+	if cfg.Line != nil {
+		line = newLineSink(*cfg.Line, apiClient, cfg.Zone)
+		log.Printf("route configured: %s recipients=%d", line.route, len(cfg.Line.Recipients))
+	}
+
 	// Discordへの接続を先に温めておきます。最初の1通が緊急地震速報だった場合、
 	// そこでDNS解決とTLSハンドシェイクから始めると通知が数百ミリ秒遅れます。
 	// 平常時に済ませられる仕事を、一番急いでいる瞬間に持ち込まないための準備です。
@@ -102,6 +108,7 @@ func main() {
 		dedup:     newDedupCache(dedupTTL, dedupMaxSize),
 		sinks:     sinks,
 		pushover:  pushover,
+		line:      line,
 	}
 
 	var wg sync.WaitGroup
@@ -113,6 +120,11 @@ func main() {
 	if pushover != nil {
 		wg.Go(func() {
 			pushover.run(ctx)
+		})
+	}
+	if line != nil {
+		wg.Go(func() {
+			line.run(ctx)
 		})
 	}
 	wg.Go(func() {
