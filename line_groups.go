@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -36,26 +36,43 @@ func (d dynamoLineGroups) activeGroups(ctx context.Context) ([]string, error) {
 		},
 	})
 
-	groups := []string{}
-	seen := map[string]bool{}
+	var items []map[string]types.AttributeValue
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range page.Items {
-			id, ok := item["group_id"].(*types.AttributeValueMemberS)
-			if !ok || !lineGroupPattern.MatchString(id.Value) {
-				// 値そのものは出しません。表が壊れていることが分かれば足ります。
-				return nil, fmt.Errorf("table %s contains an invalid group_id", d.table)
-			}
-			if !seen[id.Value] {
-				seen[id.Value] = true
-				groups = append(groups, id.Value)
-			}
-		}
+		items = append(items, page.Items...)
+	}
+
+	groups, skipped := activeGroupIDs(items)
+	if skipped > 0 {
+		// 値そのものは出しません。表に壊れた行があることが分かれば足ります。
+		log.Printf("line: skipped %d rows with an invalid group_id in %s", skipped, d.table)
 	}
 	return groups, nil
+}
+
+// activeGroupIDs は表の行からグループIDを取り出します。
+//
+// グループIDの形をしていない行は読み飛ばします。1行のためにスキャン全体を
+// エラーにすると、起動時なら本番の報がどのグループにも届かず、起動後なら
+// 古い一覧に固定されて招待・退出が反映されなくなります。
+func activeGroupIDs(items []map[string]types.AttributeValue) (groups []string, skipped int) {
+	groups = []string{}
+	seen := map[string]bool{}
+	for _, item := range items {
+		id, ok := item["group_id"].(*types.AttributeValueMemberS)
+		if !ok || !lineGroupPattern.MatchString(id.Value) {
+			skipped++
+			continue
+		}
+		if !seen[id.Value] {
+			seen[id.Value] = true
+			groups = append(groups, id.Value)
+		}
+	}
+	return groups, skipped
 }
 
 func (d dynamoLineGroups) isActive(ctx context.Context, groupID string) (bool, error) {

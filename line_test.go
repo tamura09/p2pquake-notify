@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 const (
@@ -498,5 +500,22 @@ func TestLineIsTestOnlyUnlessConnectedToProduction(t *testing.T) {
 		if cfg.Line == nil || cfg.Line.TestOnly != wantTestOnly {
 			t.Errorf("%q: line = %+v, want TestOnly=%t", url, cfg.Line, wantTestOnly)
 		}
+	}
+}
+
+// グループIDの形をしていない行が表にあっても、正しい行には送ります。
+func TestActiveGroupIDsSkipsInvalidRows(t *testing.T) {
+	items := []map[string]types.AttributeValue{
+		{"group_id": &types.AttributeValueMemberS{Value: testLineGroup}},
+		{"group_id": &types.AttributeValueMemberS{Value: "R0123456789abcdef0123456789abcdef"}},
+		{"active": &types.AttributeValueMemberBOOL{Value: true}},
+		{"group_id": &types.AttributeValueMemberS{Value: testLineGroup2}},
+		{"group_id": &types.AttributeValueMemberS{Value: testLineGroup}},
+	}
+
+	groups, skipped := activeGroupIDs(items)
+
+	if fmt.Sprint(groups) != fmt.Sprint([]string{testLineGroup, testLineGroup2}) || skipped != 2 {
+		t.Errorf("got %v skipped=%d, want both valid groups once and 2 skipped", groups, skipped)
 	}
 }
