@@ -161,7 +161,7 @@ func (l *lineSink) deliver(ctx context.Context, e *event) {
 		return
 	}
 	if len(recipients) == 0 {
-		log.Printf("route=%s no active groups, nothing sent code=%d", l.route.Name, e.Code)
+		log.Printf("route=%s no recipients, nothing sent code=%d test=%t testOnly=%t", l.route.Name, e.Code, e.Test, l.credentials.TestOnly)
 		return
 	}
 	delivered, err := l.send(ctx, recipients, text)
@@ -190,7 +190,10 @@ func (l *lineSink) recipients(ctx context.Context, e *event) ([]string, error) {
 	if e.Test || l.credentials.TestOnly {
 		group := l.credentials.TestGroup
 		if group == "" {
-			return nil, errors.New("test group is not configured")
+			// テスト配信を無効にしている正当な設定なので、失敗としては数えません
+			// (数えると訓練報のたびに p2pquake_line_failures_total が増え、本番の
+			// 送信失敗と見分けがつかなくなります)。本番へ切り替えずに送らずに終わります。
+			return nil, nil
 		}
 		active, err := l.groups.isActive(ctx, group)
 		if err != nil {

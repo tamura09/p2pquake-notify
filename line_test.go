@@ -406,10 +406,16 @@ func TestLineNeverSendsTrainingToRealGroups(t *testing.T) {
 		l := recorder.sink(t, func(int, http.ResponseWriter) {})
 		configure(l)
 
+		failuresBefore := lineFailures.Load()
 		l.deliver(context.Background(), eewEvent(t, "1", scale5Upper, false, true))
 
 		if len(recorder.requests) != 0 {
 			t.Errorf("%s: a training warning was sent to %v", name, recorder.requests[0].to)
+		}
+		// テスト配信を無効にしているだけなら失敗ではありません。退出済みは設定の誤りなので数えます。
+		counted := lineFailures.Load() - failuresBefore
+		if want := map[string]int64{"not configured": 0, "not active": 1}[name]; counted != want {
+			t.Errorf("%s: counted %d failures, want %d", name, counted, want)
 		}
 	}
 }
