@@ -54,7 +54,16 @@ Pushoverは送ったものを書き換えられないため、1つの地震で10
 
 ## 速報チャンネルと同じものをLINEにも送ります
 
-Discordの `alert` と同じもの — 緊急地震速報 (556)・津波予報 (552)・速報を流した地震の地震情報 (551) — を、LINE公式アカウントのプッシュメッセージでも送ります（[line.go](line.go)）。全国が対象で、訓練報は送りません。
+Discordの `alert` と同じもの — 緊急地震速報 (556)・津波予報 (552)・速報を流した地震の地震情報 (551) — を、LINE公式アカウントのプッシュメッセージでも送ります（[line.go](line.go)）。全国が対象です。
+
+公式アカウントも送り先も [line-charge-reminder](https://github.com/tamura09/line-charge-reminder) と同じです。
+
+| | 送り先 | 送るもの |
+| --- | --- | --- |
+| 本番 | 公式アカウントが参加している全グループ（`line-charge-reminder-groups` で `active=true`） | 本番の報 |
+| テスト | 固定のテスト用グループ（`/line-charge-reminder/user-id`） | 訓練報・テスト配信 (`test: true`)。サンドボックスへ繋いでいる時はすべて |
+
+グループの一覧は送るたびにテーブルから読み直すので、招待・退出はそのまま反映されます。読めなかった時は最後に読めた一覧へ送ります（起動時にも1回読みます）。訓練報は本番のグループへは決して送りません。テスト用グループが設定されていない・退出済みなら、本番へ切り替えずに送らずに終わります。
 
 LINEも送ったものを書き換えられず、無料枠の月間送信数が限られています（**グループ宛ては人数ぶん数えられます**）。Discordのように全報を流すと1つの地震で十数通になるので、送る報を絞ります。
 
@@ -68,7 +77,7 @@ LINEも送ったものを書き換えられず、無料枠の月間送信数が�
 
 再試行は5xxと通信エラーだけで、同じ `X-Line-Retry-Key` を使います（応答を受け取れなかっただけで受け付けられていた場合に二重に届かないため）。429は月間の上限到達のことが多いので再試行しません。
 
-送り先は `/p2pquake-notify/line/to` に、ユーザID (`U…`)・グループID (`C…`)・トークルームID (`R…`) をカンマか改行区切りで入れます。トークンと送り先が読めない・プレースホルダのままでも起動は止めず、`line: disabled: ...` を1行出して無効になります（Pushoverと同じ理由）。
+トークンが読めない・プレースホルダのままでも起動は止めず、`line: disabled: ...` を1行出して無効になります（Pushoverと同じ理由）。テスト用グループだけが読めない時は本番への送信を続け、テスト配信だけを無効にします。トークンは起動時に読むので、入れ替えた時はタスクを入れ替えてください。
 
 ## 同じ地震の続報は1通にまとめます
 
@@ -136,8 +145,9 @@ LINEも送ったものを書き換えられず、無料枠の月間送信数が�
 | `P2PQUAKE_LOCAL_MIN_SCALE` | `-1` (しきい値なし) | 地域ルートの最小震度。`30`=震度3、`45`=震度5弱 |
 | `P2PQUAKE_PUSHOVER_TOKEN_PARAMETER_NAME` | (なし) | PushoverのアプリトークンのSSM SecureString名。ユーザキーと両方未設定ならPushoverは無効 |
 | `P2PQUAKE_PUSHOVER_USER_PARAMETER_NAME` | (なし) | Pushoverのユーザキー (またはグループキー) のSSM SecureString名 |
-| `P2PQUAKE_LINE_TOKEN_PARAMETER_NAME` | (なし) | LINEのチャネルアクセストークン (長期) のSSM SecureString名。送り先と両方未設定ならLINEは無効 |
-| `P2PQUAKE_LINE_TO_PARAMETER_NAME` | (なし) | LINEの送り先ID (カンマ・改行区切りで複数可) のSSM SecureString名 |
+| `P2PQUAKE_LINE_TOKEN_PARAMETER_NAME` | (なし) | LINEのチャネルアクセストークン (長期) のSSM SecureString名。3つとも未設定ならLINEは無効 |
+| `P2PQUAKE_LINE_GROUPS_TABLE` | (なし) | 参加中のグループを記録しているDynamoDBテーブル名 |
+| `P2PQUAKE_LINE_TEST_GROUP_PARAMETER_NAME` | (なし) | テスト用グループIDのSSM SecureString名。未設定ならテスト配信は無効 |
 | `P2PQUAKE_WS_URL` | `wss://api.p2pquake.net/v2/ws` | 接続先。サンドボックスへの切り替えに使います |
 | `P2PQUAKE_HISTORY_URL` | `https://api.p2pquake.net/v2/history` | 再接続時のギャップ補完に読むREST |
 | `P2PQUAKE_BACKFILL_LIMIT` | `20` | 補完で読み直す件数（**code 1つあたり**）。`0`で補完しない |

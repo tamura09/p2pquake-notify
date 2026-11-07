@@ -26,25 +26,45 @@ const (
 	lineRetryDelay = time.Second
 )
 
-// lineRecipientPattern は送り先のID。ユーザ(U)・グループ(C)・トークルーム(R)の
-// いずれも、先頭の1文字に16進32桁が続く形です。
-var lineRecipientPattern = regexp.MustCompile(`^[UCR][0-9a-f]{32}$`)
+// lineGroupPattern はグループID。先頭の C に16進32桁が続く形です。
+var lineGroupPattern = regexp.MustCompile(`^C[0-9a-f]{32}$`)
 
 // lineRoute は LINE へ流すイベントの条件。Discord の alert ルートと同じにしています:
 // 緊急地震速報(556)と津波予報(552)、それに速報を流した地震の地震情報(551)。
-// 訓練報は流しません。
+//
+// alert と違って訓練報・テスト配信も通しますが、届け先はテスト用グループだけです
+// (lineSink.recipients)。本番のグループには決して流しません。
 func lineRoute() route {
 	return route{
 		Name:          "line",
 		Codes:         codeSet(codeEEW, codeJMATsunami),
 		MinScale:      scaleUnknown,
+		IncludeTest:   true,
 		QuakeAfterEEW: true,
 	}
 }
 
+// lineCredentials は line-charge-reminder と同じ公式アカウントで送るための設定。
+// 送り先も同じで、公式アカウントが参加している全グループが本番、
+// 固定のテスト用グループがテストです。
 type lineCredentials struct {
-	Token      string
-	Recipients []string
+	Token string
+
+	// TestGroup はテスト用グループのID。設定されていなければ空で、
+	// 訓練報・テスト配信はどこにも送りません。
+	TestGroup string
+
+	// TestOnly なら本番のイベントもテスト用グループだけに送ります。
+	// サンドボックスへ繋いでいる時(ダミーの地震が流れ続ける)に使います。
+	TestOnly bool
+}
+
+// lineGroupDirectory は公式アカウントが参加しているグループを引く口。
+// 本番は line-charge-reminder の Webhook が参加・退出を記録している DynamoDB の
+// テーブルです。テストで差し替えます。
+type lineGroupDirectory interface {
+	activeGroups(ctx context.Context) ([]string, error)
+	isActive(ctx context.Context, groupID string) (bool, error)
 }
 
 // lineSink は Discord の sink と同じく独立した goroutine とキューを持ちます。
@@ -57,6 +77,12 @@ type lineSink struct {
 	zone        *time.Location
 	queue       chan *event
 	retryDelay  time.Duration
+
+	groups lineGroupDirectory
+
+	// lastGroups は最後に読めた参加中のグループ。地震の最中にテーブルが
+	// 読めなかった時は、送らないよりはこれに送ります。
+	lastGroups []string
 
 	// eews は緊急地震速報のどの報を送るかを決めます(throttle.go)。
 	eews eewThrottle
@@ -79,10 +105,11 @@ type lineQuake struct {
 	written time.Time
 }
 
-func newLineSink(credentials lineCredentials, client *http.Client, zone *time.Location) *lineSink {
+func newLineSink(credentials lineCredentials, groups lineGroupDirectory, client *http.Client, zone *time.Location) *lineSink {
 	return &lineSink{
 		route:       lineRoute(),
 		credentials: credentials,
+		groups:      groups,
 		endpoint:    defaultLinePushEndpoint,
 		client:      client,
 		zone:        zone,
@@ -126,13 +153,62 @@ func (l *lineSink) deliver(ctx context.Context, e *event) {
 	if !ok {
 		return
 	}
-	if err := l.send(ctx, text); err != nil {
+	recipients, err := l.recipients(ctx, e)
+	if err != nil {
+		log.Printf("route=%s no recipients code=%d test=%t: %v", l.route.Name, e.Code, e.Test, err)
+		lineFailures.Add(1)
+		return
+	}
+	if len(recipients) == 0 {
+		log.Printf("route=%s no active groups, nothing sent code=%d", l.route.Name, e.Code)
+		return
+	}
+	if err := l.send(ctx, recipients, text); err != nil {
 		log.Printf("route=%s post failed code=%d: %v", l.route.Name, e.Code, err)
 		lineFailures.Add(1)
 		return
 	}
 	lineSent.Add(1)
 	l.remember(e)
+}
+
+// recipients はこのイベントの送り先を返します。
+//
+// 訓練報・テスト配信はテスト用グループだけへ送ります。本番のグループへ訓練報が
+// 飛ぶと、いざという時に誰も信じなくなります。テスト用グループが設定されて
+// いない・退出済みなら、本番へ切り替えずにエラーにします(line-charge-reminder の
+// テスト配信と同じ扱い)。
+func (l *lineSink) recipients(ctx context.Context, e *event) ([]string, error) {
+	if e.Test || l.credentials.TestOnly {
+		group := l.credentials.TestGroup
+		if group == "" {
+			return nil, errors.New("test group is not configured")
+		}
+		active, err := l.groups.isActive(ctx, group)
+		if err != nil {
+			return nil, fmt.Errorf("look up test group: %w", err)
+		}
+		if !active {
+			return nil, errors.New("test group is not active")
+		}
+		return []string{group}, nil
+	}
+	return l.activeGroups(ctx)
+}
+
+// activeGroups は参加中の全グループを返します。テーブルが読めなかった時は
+// 最後に読めた一覧を使います。
+func (l *lineSink) activeGroups(ctx context.Context) ([]string, error) {
+	groups, err := l.groups.activeGroups(ctx)
+	if err == nil {
+		l.lastGroups = groups
+		return groups, nil
+	}
+	if l.lastGroups == nil {
+		return nil, fmt.Errorf("list active groups: %w", err)
+	}
+	log.Printf("route=%s list active groups failed, using the last known %d: %v", l.route.Name, len(l.lastGroups), err)
+	return l.lastGroups, nil
 }
 
 // compose は送るべきイベントならメッセージ本文を返します。
@@ -259,15 +335,15 @@ func lineText(payload discordWebhookPayload) string {
 
 // send は送り先ごとにプッシュメッセージを送ります。1つの送り先で失敗しても
 // 残りへの送信は続けます。
-func (l *lineSink) send(ctx context.Context, text string) error {
+func (l *lineSink) send(ctx context.Context, recipients []string, text string) error {
 	var failures []error
-	for _, recipient := range l.credentials.Recipients {
+	for _, recipient := range recipients {
 		if err := l.push(ctx, recipient, text); err != nil {
 			failures = append(failures, err)
 		}
 	}
 	if len(failures) > 0 {
-		return fmt.Errorf("%d of %d recipients failed: %w", len(failures), len(l.credentials.Recipients), errors.Join(failures...))
+		return fmt.Errorf("%d of %d recipients failed: %w", len(failures), len(recipients), errors.Join(failures...))
 	}
 	return nil
 }
@@ -363,27 +439,4 @@ func newRetryKey() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-// parseLineRecipients はカンマ・空白・改行区切りの送り先IDを読みます。
-func parseLineRecipients(raw string) ([]string, error) {
-	fields := strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\n' || r == '\r' || r == '\t'
-	})
-	recipients := make([]string, 0, len(fields))
-	seen := map[string]bool{}
-	for i, field := range fields {
-		if !lineRecipientPattern.MatchString(field) {
-			// 値そのものは出しません。何番目が悪いかが分かれば足ります。
-			return nil, fmt.Errorf("recipient #%d is not a LINE user, group or room ID", i+1)
-		}
-		if !seen[field] {
-			seen[field] = true
-			recipients = append(recipients, field)
-		}
-	}
-	if len(recipients) == 0 {
-		return nil, errors.New("no recipients")
-	}
-	return recipients, nil
 }

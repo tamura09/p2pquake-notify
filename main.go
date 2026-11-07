@@ -19,6 +19,7 @@ import (
 	_ "time/tzdata"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
@@ -83,8 +84,16 @@ func main() {
 
 	var line *lineSink
 	if cfg.Line != nil {
-		line = newLineSink(*cfg.Line, apiClient, cfg.Zone)
-		log.Printf("route configured: %s recipients=%d", line.route, len(cfg.Line.Recipients))
+		groups := dynamoLineGroups{client: dynamodb.NewFromConfig(awsConfig), table: cfg.LineGroupsTable}
+		line = newLineSink(*cfg.Line, groups, apiClient, cfg.Zone)
+		// 参加中のグループを先に読んでおきます。地震の最中にテーブルが読めなくても、
+		// ここで読めた一覧へは送れます。
+		active, err := line.activeGroups(ctx)
+		if err != nil {
+			log.Printf("line: %v (will retry on the first notification)", err)
+		}
+		log.Printf("route configured: %s groups=%d testGroup=%t testOnly=%t",
+			line.route, len(active), cfg.Line.TestGroup != "", cfg.Line.TestOnly)
 	}
 
 	// Discordへの接続を先に温めておきます。最初の1通が緊急地震速報だった場合、

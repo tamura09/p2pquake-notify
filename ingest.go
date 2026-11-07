@@ -216,7 +216,8 @@ func (i *ingest) accepts(r route, e *event) bool {
 // rememberEEWQuake は、緊急地震速報を流したルートについて、その地震の発生時刻を
 // 覚えます。551 との突き合わせに使うので、対象は QuakeAfterEEW のルートだけです。
 func (i *ingest) rememberEEWQuake(r route, e *event) {
-	if !r.QuakeAfterEEW || e.Code != codeEEW {
+	if !r.QuakeAfterEEW || e.Code != codeEEW || e.Test {
+		// 訓練報の発生時刻を覚えると、同じ時刻の本物の地震情報を通しかねません。
 		return
 	}
 	message, ok := e.Payload.(eew)

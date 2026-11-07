@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,9 +16,30 @@ import (
 )
 
 const (
-	testLineUser  = "U0123456789abcdef0123456789abcdef"
-	testLineGroup = "C0123456789abcdef0123456789abcdef"
+	testLineGroup  = "C0123456789abcdef0123456789abcdef"
+	testLineGroup2 = "Cfedcba9876543210fedcba9876543210"
+	testLineTest   = "C00000000000000000000000000000000"
 )
+
+// fakeLineGroups は参加中のグループの表の代わり。
+type fakeLineGroups struct {
+	active []string
+	err    error
+}
+
+func (f *fakeLineGroups) activeGroups(context.Context) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return append([]string(nil), f.active...), nil
+}
+
+func (f *fakeLineGroups) isActive(_ context.Context, groupID string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return slices.Contains(f.active, groupID), nil
+}
 
 // quakeReport は eewEvent(t, ...) と同じ地震についての地震情報(551)を1件組み立てます。
 // 発生時刻は速報の推定発生時刻から数秒ずらしてあります(実際にもずれます)。
@@ -45,7 +68,10 @@ func quakeReport(t *testing.T, issueType, issued, hypocenterName string, maxScal
 }
 
 func testLineSink() *lineSink {
-	return newLineSink(lineCredentials{Token: "token", Recipients: []string{testLineUser}}, &http.Client{Timeout: time.Second}, testZone())
+	return newLineSink(
+		lineCredentials{Token: "token", TestGroup: testLineTest},
+		&fakeLineGroups{active: []string{testLineGroup}},
+		&http.Client{Timeout: time.Second}, testZone())
 }
 
 type lineRequest struct {
@@ -114,8 +140,8 @@ func TestLineRouteMirrorsTheAlertChannel(t *testing.T) {
 	if !r.matches(tsunamiEvent(t, "Watch", false)) {
 		t.Error("a tsunami forecast did not match")
 	}
-	if r.matches(eewEvent(t, "1", scale5Upper, false, true)) {
-		t.Error("a training early warning matched; it must never reach LINE")
+	if !r.matches(eewEvent(t, "1", scale5Upper, false, true)) {
+		t.Error("a training early warning did not match; it must reach the test group")
 	}
 	if !r.QuakeAfterEEW {
 		t.Error("the LINE route must carry the earthquake report of a warned earthquake, as alert does")
@@ -234,16 +260,15 @@ func TestLineRetriesAReportWhoseSendFailed(t *testing.T) {
 func TestLinePushSendsTheMessage(t *testing.T) {
 	recorder := &lineRecorder{}
 	l := recorder.sink(t, func(int, http.ResponseWriter) {})
-	l.credentials.Recipients = []string{testLineUser, testLineGroup}
 
-	if err := l.send(context.Background(), "本文"); err != nil {
+	if err := l.send(context.Background(), []string{testLineGroup, testLineGroup2}, "本文"); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
 	if len(recorder.requests) != 2 {
 		t.Fatalf("made %d requests, want one per recipient", len(recorder.requests))
 	}
-	for i, to := range []string{testLineUser, testLineGroup} {
+	for i, to := range []string{testLineGroup, testLineGroup2} {
 		got := recorder.requests[i]
 		if got.to != to || got.text != "本文" || got.authorization != "Bearer token" || got.retryKey == "" {
 			t.Errorf("request %d = %+v", i, got)
@@ -267,7 +292,7 @@ func TestLinePushRetriesServerErrorsWithTheSameKey(t *testing.T) {
 		}
 	})
 
-	if err := l.send(context.Background(), "本文"); err != nil {
+	if err := l.send(context.Background(), []string{testLineGroup}, "本文"); err != nil {
 		t.Fatalf("send: %v (a 409 for an accepted retry key means it was delivered)", err)
 	}
 	if len(recorder.requests) != 2 {
@@ -286,7 +311,7 @@ func TestLinePushDoesNotRetryARejectedRequest(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message":"You have reached your monthly limit."}`))
 		})
 
-		err := l.send(context.Background(), "本文")
+		err := l.send(context.Background(), []string{testLineGroup}, "本文")
 		if err == nil || !strings.Contains(err.Error(), "monthly limit") {
 			t.Errorf("%d: err = %v, want LINE's reason", code, err)
 		}
@@ -306,43 +331,99 @@ func TestLineTextFitsTheLimit(t *testing.T) {
 	}
 }
 
-func TestParseLineRecipients(t *testing.T) {
-	got, err := parseLineRecipients(" " + testLineUser + ",\n" + testLineGroup + "," + testLineUser + "\n")
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if fmt.Sprint(got) != fmt.Sprint([]string{testLineUser, testLineGroup}) {
-		t.Errorf("got %v", got)
-	}
+// 本番のイベントは参加中の全グループへ、訓練報はテスト用グループだけへ届きます。
+func TestLineSendsRealEventsToEveryGroupAndTrainingToTheTestGroup(t *testing.T) {
+	recorder := &lineRecorder{}
+	l := recorder.sink(t, func(int, http.ResponseWriter) {})
+	l.groups = &fakeLineGroups{active: []string{testLineGroup, testLineGroup2, testLineTest}}
 
-	for _, raw := range []string{"", "MANAGED_OUTSIDE_TERRAFORM", testLineUser + ",U123"} {
-		if _, err := parseLineRecipients(raw); err == nil {
-			t.Errorf("%q was accepted", raw)
+	l.deliver(context.Background(), tsunamiEvent(t, "Warning", false))
+	l.deliver(context.Background(), eewEvent(t, "1", scale5Upper, false, true))
+
+	got := []string{}
+	for _, request := range recorder.requests {
+		got = append(got, request.to)
+	}
+	want := []string{testLineGroup, testLineGroup2, testLineTest, testLineTest}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("sent to %v, want %v (every group, then the test group only)", got, want)
+	}
+}
+
+// テスト用グループが設定されていない・退出済みなら、訓練報は本番へ切り替えずに落とします。
+func TestLineNeverSendsTrainingToRealGroups(t *testing.T) {
+	for name, configure := range map[string]func(*lineSink){
+		"not configured": func(l *lineSink) { l.credentials.TestGroup = "" },
+		"not active":     func(l *lineSink) { l.groups = &fakeLineGroups{active: []string{testLineGroup}} },
+	} {
+		recorder := &lineRecorder{}
+		l := recorder.sink(t, func(int, http.ResponseWriter) {})
+		configure(l)
+
+		l.deliver(context.Background(), eewEvent(t, "1", scale5Upper, false, true))
+
+		if len(recorder.requests) != 0 {
+			t.Errorf("%s: a training warning was sent to %v", name, recorder.requests[0].to)
 		}
 	}
 }
 
-func TestReadLineCredentialsRejectsThePlaceholder(t *testing.T) {
-	resolver := mapResolver{"/token": "MANAGED_OUTSIDE_TERRAFORM", "/to": testLineGroup}
-	if _, err := readLineCredentials(context.Background(), resolver, "/token", "/to"); err == nil {
+// サンドボックスへ繋いでいる時は、本物の形をしたイベントもテスト用グループだけへ送ります。
+func TestLineTestOnlyKeepsEverythingInTheTestGroup(t *testing.T) {
+	recorder := &lineRecorder{}
+	l := recorder.sink(t, func(int, http.ResponseWriter) {})
+	l.groups = &fakeLineGroups{active: []string{testLineGroup, testLineTest}}
+	l.credentials.TestOnly = true
+
+	l.deliver(context.Background(), tsunamiEvent(t, "Warning", false))
+
+	if len(recorder.requests) != 1 || recorder.requests[0].to != testLineTest {
+		t.Errorf("sent %+v, want the test group only", recorder.requests)
+	}
+}
+
+// 地震の最中にグループの表が読めなくても、最後に読めた一覧へ送ります。
+func TestLineFallsBackToTheLastKnownGroups(t *testing.T) {
+	recorder := &lineRecorder{}
+	l := recorder.sink(t, func(int, http.ResponseWriter) {})
+	groups := &fakeLineGroups{active: []string{testLineGroup}}
+	l.groups = groups
+
+	if _, err := l.activeGroups(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	groups.err = errors.New("throttled")
+
+	l.deliver(context.Background(), tsunamiEvent(t, "Warning", false))
+
+	if len(recorder.requests) != 1 || recorder.requests[0].to != testLineGroup {
+		t.Errorf("sent %+v, want the last known group", recorder.requests)
+	}
+}
+
+func TestReadLineCredentials(t *testing.T) {
+	resolver := mapResolver{"/token": "MANAGED_OUTSIDE_TERRAFORM", "/test": testLineTest}
+	if _, err := readLineCredentials(context.Background(), resolver, "/token", "table", "/test"); err == nil {
 		t.Error("the Terraform placeholder was accepted as a token")
 	}
 
-	resolver = mapResolver{"/token": "abc+/=\n", "/to": "MANAGED_OUTSIDE_TERRAFORM"}
-	if _, err := readLineCredentials(context.Background(), resolver, "/token", "/to"); err == nil {
-		t.Error("the Terraform placeholder was accepted as a recipient")
-	}
-
-	resolver = mapResolver{"/token": "abc+/=\n", "/to": testLineGroup}
-	credentials, err := readLineCredentials(context.Background(), resolver, "/token", "/to")
+	resolver = mapResolver{"/token": "abc+/=\n", "/test": testLineTest + "\n"}
+	credentials, err := readLineCredentials(context.Background(), resolver, "/token", "table", "/test")
 	if err != nil {
 		t.Fatalf("valid values rejected: %v", err)
 	}
-	if credentials.Token != "abc+/=" {
-		t.Errorf("token = %q, want it trimmed", credentials.Token)
+	if credentials.Token != "abc+/=" || credentials.TestGroup != testLineTest {
+		t.Errorf("got %+v, want both trimmed", credentials)
 	}
 
-	if _, err := readLineCredentials(context.Background(), resolver, "/token", ""); err == nil {
-		t.Error("a half-configured LINE was accepted")
+	// テスト用グループが読めなくても、本番への送信は止めません。
+	resolver = mapResolver{"/token": "abc", "/test": "MANAGED_OUTSIDE_TERRAFORM"}
+	credentials, err = readLineCredentials(context.Background(), resolver, "/token", "table", "/test")
+	if err != nil || credentials.TestGroup != "" {
+		t.Errorf("got %+v, %v; want production enabled and the test group disabled", credentials, err)
+	}
+
+	if _, err := readLineCredentials(context.Background(), resolver, "/token", "", "/test"); err == nil {
+		t.Error("a LINE without a group table was accepted")
 	}
 }
