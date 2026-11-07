@@ -441,7 +441,7 @@ func TestLineFallsBackToTheLastKnownGroups(t *testing.T) {
 	groups := &fakeLineGroups{active: []string{testLineGroup}}
 	l.groups = groups
 
-	if _, err := l.activeGroups(context.Background()); err != nil {
+	if _, err := l.refreshGroups(context.Background()); err != nil {
 		t.Fatalf("prime: %v", err)
 	}
 	groups.err = errors.New("throttled")
@@ -524,4 +524,62 @@ func TestActiveGroupIDsSkipsInvalidRows(t *testing.T) {
 	if fmt.Sprint(groups) != fmt.Sprint([]string{testLineGroup, testLineGroup2}) || skipped != 2 {
 		t.Errorf("got %v skipped=%d, want both valid groups once and 2 skipped", groups, skipped)
 	}
+}
+
+// 手元に一覧があれば、送る時にテーブルを待ちません。テーブルが遅いと、
+// 緊急地震速報がその分遅れて届くためです。
+func TestLineSendsWithoutWaitingForTheTable(t *testing.T) {
+	recorder := &lineRecorder{}
+	l := recorder.sink(t, func(int, http.ResponseWriter) {})
+	groups := &countingLineGroups{fakeLineGroups: fakeLineGroups{active: []string{testLineGroup}}}
+	l.groups = groups
+
+	if _, err := l.refreshGroups(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	l.deliver(context.Background(), tsunamiEvent(t, "Warning", false))
+
+	if groups.calls != 1 {
+		t.Errorf("read the table %d times, want once (the prime only)", groups.calls)
+	}
+	if len(recorder.requests) != 1 || recorder.requests[0].to != testLineGroup {
+		t.Errorf("sent %+v, want the cached group", recorder.requests)
+	}
+}
+
+// 招待・退出は背景の読み直しで送り先に反映されます。
+func TestLineRefreshesGroupsInTheBackground(t *testing.T) {
+	l := testLineSink()
+	groups := &fakeLineGroups{active: []string{testLineGroup}}
+	l.groups = groups
+	l.refreshInterval = time.Millisecond
+	if _, err := l.refreshGroups(context.Background()); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// run を始める前に書き換えるので、背景の読み直しとは競合しません。
+	groups.active = []string{testLineGroup, testLineGroup2}
+	go l.run(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, _ := l.activeGroups(context.Background())
+		if len(got) == 2 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Error("a newly joined group never became a recipient")
+}
+
+type countingLineGroups struct {
+	fakeLineGroups
+	calls int
+}
+
+func (c *countingLineGroups) activeGroups(ctx context.Context) ([]string, error) {
+	c.calls++
+	return c.fakeLineGroups.activeGroups(ctx)
 }

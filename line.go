@@ -25,6 +25,10 @@ const (
 
 	// lineRetryDelay は最初の再試行までの待ち時間。以後は倍々にします。
 	lineRetryDelay = time.Second
+
+	// lineGroupRefreshInterval は参加中のグループを読み直す間隔。招待されたばかりの
+	// グループは、最長でこの時間だけ送り先に入りません。
+	lineGroupRefreshInterval = time.Minute
 )
 
 // lineGroupPattern はグループID。先頭の C に16進32桁が続く形です。
@@ -81,9 +85,15 @@ type lineSink struct {
 
 	groups lineGroupDirectory
 
-	// lastGroups は最後に読めた参加中のグループ。地震の最中にテーブルが
-	// 読めなかった時は、送らないよりはこれに送ります。
+	// lastGroups は最後に読めた参加中のグループ。平常時に refreshInterval ごとに
+	// 読み直し(run)、送る時はこれをそのまま使います。送るたびにテーブルを
+	// 読むと、テーブルが遅い時に緊急地震速報がその分(最大5秒)遅れて届くためです。
+	// 背景の更新と送信goroutineの両方が触るので mu で守ります。
+	mu         sync.Mutex
 	lastGroups []string
+
+	// refreshInterval は参加中のグループを読み直す間隔。
+	refreshInterval time.Duration
 
 	// eews は緊急地震速報のどの報を送るかを決めます(throttle.go)。
 	eews eewThrottle
@@ -116,8 +126,11 @@ func newLineSink(credentials lineCredentials, groups lineGroupDirectory, client 
 		zone:        zone,
 		queue:       make(chan *event, queueDepth),
 		retryDelay:  lineRetryDelay,
-		eews:        newEEWThrottle(),
-		quakes:      map[string]lineQuake{},
+
+		refreshInterval: lineGroupRefreshInterval,
+
+		eews:   newEEWThrottle(),
+		quakes: map[string]lineQuake{},
 	}
 }
 
@@ -139,6 +152,23 @@ func (l *lineSink) offer(e *event) {
 }
 
 func (l *lineSink) run(ctx context.Context) {
+	// 送り先の一覧は送信とは別のgoroutineで読み直します。送信の順番待ちに
+	// 一覧の読み込みを挟まないためです。
+	go func() {
+		ticker := time.NewTicker(l.refreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := l.refreshGroups(ctx); err != nil {
+					log.Printf("route=%s refresh active groups failed (keeping the last known list): %v", l.route.Name, err)
+				}
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -207,19 +237,29 @@ func (l *lineSink) recipients(ctx context.Context, e *event) ([]string, error) {
 	return l.activeGroups(ctx)
 }
 
-// activeGroups は参加中の全グループを返します。テーブルが読めなかった時は
-// 最後に読めた一覧を使います。
+// activeGroups は送る時の送り先を返します。手元に一覧があればテーブルを
+// 待たずにそれを使い、まだ一度も読めていない時だけその場で読みます。
 func (l *lineSink) activeGroups(ctx context.Context) ([]string, error) {
-	groups, err := l.groups.activeGroups(ctx)
-	if err == nil {
-		l.lastGroups = groups
-		return groups, nil
+	l.mu.Lock()
+	cached := l.lastGroups
+	l.mu.Unlock()
+	if cached != nil {
+		return cached, nil
 	}
-	if l.lastGroups == nil {
+	return l.refreshGroups(ctx)
+}
+
+// refreshGroups は参加中のグループを読み直して手元の一覧を差し替えます。
+// 読めなかった時は手元の一覧を変えません。
+func (l *lineSink) refreshGroups(ctx context.Context) ([]string, error) {
+	groups, err := l.groups.activeGroups(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("list active groups: %w", err)
 	}
-	log.Printf("route=%s list active groups failed, using the last known %d: %v", l.route.Name, len(l.lastGroups), err)
-	return l.lastGroups, nil
+	l.mu.Lock()
+	l.lastGroups = groups
+	l.mu.Unlock()
+	return groups, nil
 }
 
 // compose は送るべきイベントならメッセージ本文を返します。

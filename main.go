@@ -86,11 +86,11 @@ func main() {
 	if cfg.Line != nil {
 		groups := dynamoLineGroups{client: dynamodb.NewFromConfig(awsConfig), table: cfg.LineGroupsTable}
 		line = newLineSink(*cfg.Line, groups, apiClient, cfg.Zone)
-		// 参加中のグループを先に読んでおきます。地震の最中にテーブルが読めなくても、
-		// ここで読めた一覧へは送れます。
-		active, err := line.activeGroups(ctx)
+		// 参加中のグループを先に読んでおきます。以後は1分ごとに読み直し、送る時は
+		// 手元の一覧を使うので、地震の最中にテーブルを待つことはありません。
+		active, err := line.refreshGroups(ctx)
 		if err != nil {
-			log.Printf("line: %v (will retry on the first notification)", err)
+			log.Printf("line: %v (will retry in the background and on the first notification)", err)
 		}
 		log.Printf("route configured: %s groups=%d testGroup=%t testOnly=%t",
 			line.route, len(active), cfg.Line.TestGroup != "", cfg.Line.TestOnly)
