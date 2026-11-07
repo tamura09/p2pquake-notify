@@ -158,8 +158,11 @@ func loadConfig(ctx context.Context, resolver parameterResolver) (config, error)
 
 	cfg.Pushover = loadPushoverCredentials(ctx, resolver)
 	cfg.Line, cfg.LineGroupsTable = loadLineCredentials(ctx, resolver)
-	if cfg.Line != nil && cfg.WebSocketURL == sandboxWebSocketURL {
-		// サンドボックスはダミーの地震を流し続けるので、本番のグループへは送りません。
+	if cfg.Line != nil && cfg.WebSocketURL != defaultWebSocketURL {
+		// 本番の上流以外(サンドボックス・ローカルのモック)はダミーの地震を流すので、
+		// 本番のグループへは送りません。サンドボックスかどうかを URL で当てに
+		// いくと、末尾のスラッシュやクエリひとつで判定を外し、ダミーの緊急地震速報が
+		// 全グループへ届きます。本番の URL と完全に一致する時だけを本番とみなします。
 		cfg.Line.TestOnly = true
 	}
 

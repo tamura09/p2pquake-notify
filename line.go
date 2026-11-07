@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -163,12 +164,19 @@ func (l *lineSink) deliver(ctx context.Context, e *event) {
 		log.Printf("route=%s no active groups, nothing sent code=%d", l.route.Name, e.Code)
 		return
 	}
-	if err := l.send(ctx, recipients, text); err != nil {
+	delivered, err := l.send(ctx, recipients, text)
+	if err != nil {
 		log.Printf("route=%s post failed code=%d: %v", l.route.Name, e.Code, err)
 		lineFailures.Add(1)
+	}
+	if delivered == 0 {
 		return
 	}
 	lineSent.Add(1)
+	// 1つでも届いたら送った扱いにします。全員に届くまで送った扱いにしないと、
+	// 退出を取りこぼしたグループが1つあるだけで(毎回 4xx になります)、
+	// 緊急地震速報の続報が毎回「最初の報」と判定され、届いているグループにも
+	// 全報が流れます。失敗したグループは、その次に送る報から受け取ります。
 	l.remember(e)
 }
 
@@ -333,19 +341,32 @@ func lineText(payload discordWebhookPayload) string {
 	return truncateRunes(strings.Join(lines, "\n"), lineTextLimit)
 }
 
-// send は送り先ごとにプッシュメッセージを送ります。1つの送り先で失敗しても
+// send は送り先ごとにプッシュメッセージを送り、届いた数を返します。
+//
+// 送り先は並行して送ります。1つずつ送ると、最後のグループには前のグループの
+// 往復時間(1件0.2秒ほど)がすべて積み上がって届きます。1つの送り先で失敗しても
 // 残りへの送信は続けます。
-func (l *lineSink) send(ctx context.Context, recipients []string, text string) error {
+func (l *lineSink) send(ctx context.Context, recipients []string, text string) (int, error) {
+	results := make([]error, len(recipients))
+	var wg sync.WaitGroup
+	for i, recipient := range recipients {
+		wg.Go(func() {
+			results[i] = l.push(ctx, recipient, text)
+		})
+	}
+	wg.Wait()
+
 	var failures []error
-	for _, recipient := range recipients {
-		if err := l.push(ctx, recipient, text); err != nil {
+	for _, err := range results {
+		if err != nil {
 			failures = append(failures, err)
 		}
 	}
+	delivered := len(recipients) - len(failures)
 	if len(failures) > 0 {
-		return fmt.Errorf("%d of %d recipients failed: %w", len(failures), len(recipients), errors.Join(failures...))
+		return delivered, fmt.Errorf("%d of %d recipients failed: %w", len(failures), len(recipients), errors.Join(failures...))
 	}
-	return nil
+	return delivered, nil
 }
 
 // push は1つの送り先へ送ります。再試行するのはサーバエラーと通信エラーだけです。

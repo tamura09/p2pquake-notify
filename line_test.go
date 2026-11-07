@@ -122,6 +122,19 @@ func (r *lineRecorder) sink(t *testing.T, respond func(attempt int, w http.Respo
 	return l
 }
 
+// recipients は送り先を並べ替えて返します。送り先は並行して送るので、
+// 届く順は決まっていません。
+func (r *lineRecorder) recipients() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	to := make([]string, 0, len(r.requests))
+	for _, request := range r.requests {
+		to = append(to, request.to)
+	}
+	slices.Sort(to)
+	return to
+}
+
 func (r *lineRecorder) texts() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -261,16 +274,19 @@ func TestLinePushSendsTheMessage(t *testing.T) {
 	recorder := &lineRecorder{}
 	l := recorder.sink(t, func(int, http.ResponseWriter) {})
 
-	if err := l.send(context.Background(), []string{testLineGroup, testLineGroup2}, "本文"); err != nil {
+	if _, err := l.send(context.Background(), []string{testLineGroup, testLineGroup2}, "本文"); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
 	if len(recorder.requests) != 2 {
 		t.Fatalf("made %d requests, want one per recipient", len(recorder.requests))
 	}
-	for i, to := range []string{testLineGroup, testLineGroup2} {
-		got := recorder.requests[i]
-		if got.to != to || got.text != "本文" || got.authorization != "Bearer token" || got.retryKey == "" {
+	// 送り先は並行して送るので、届く順は決まっていません。
+	if got := recorder.recipients(); fmt.Sprint(got) != fmt.Sprint([]string{testLineGroup, testLineGroup2}) {
+		t.Errorf("sent to %v", got)
+	}
+	for i, got := range recorder.requests {
+		if got.text != "本文" || got.authorization != "Bearer token" || got.retryKey == "" {
 			t.Errorf("request %d = %+v", i, got)
 		}
 	}
@@ -292,7 +308,7 @@ func TestLinePushRetriesServerErrorsWithTheSameKey(t *testing.T) {
 		}
 	})
 
-	if err := l.send(context.Background(), []string{testLineGroup}, "本文"); err != nil {
+	if _, err := l.send(context.Background(), []string{testLineGroup}, "本文"); err != nil {
 		t.Fatalf("send: %v (a 409 for an accepted retry key means it was delivered)", err)
 	}
 	if len(recorder.requests) != 2 {
@@ -311,7 +327,7 @@ func TestLinePushDoesNotRetryARejectedRequest(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message":"You have reached your monthly limit."}`))
 		})
 
-		err := l.send(context.Background(), []string{testLineGroup}, "本文")
+		_, err := l.send(context.Background(), []string{testLineGroup}, "本文")
 		if err == nil || !strings.Contains(err.Error(), "monthly limit") {
 			t.Errorf("%d: err = %v, want LINE's reason", code, err)
 		}
@@ -338,15 +354,43 @@ func TestLineSendsRealEventsToEveryGroupAndTrainingToTheTestGroup(t *testing.T) 
 	l.groups = &fakeLineGroups{active: []string{testLineGroup, testLineGroup2, testLineTest}}
 
 	l.deliver(context.Background(), tsunamiEvent(t, "Warning", false))
-	l.deliver(context.Background(), eewEvent(t, "1", scale5Upper, false, true))
-
-	got := []string{}
-	for _, request := range recorder.requests {
-		got = append(got, request.to)
+	if got, want := recorder.recipients(), []string{testLineTest, testLineGroup, testLineGroup2}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("a real tsunami forecast went to %v, want every group %v", got, want)
 	}
-	want := []string{testLineGroup, testLineGroup2, testLineTest, testLineTest}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("sent to %v, want %v (every group, then the test group only)", got, want)
+
+	recorder.requests = nil
+	l.deliver(context.Background(), eewEvent(t, "1", scale5Upper, false, true))
+	if got := recorder.recipients(); fmt.Sprint(got) != fmt.Sprint([]string{testLineTest}) {
+		t.Errorf("a training warning went to %v, want the test group only", got)
+	}
+}
+
+// 一部のグループだけ失敗しても、届いたグループがあれば送った扱いにします。
+// そうしないと、退出を取りこぼしたグループが1つあるだけで続報が毎回
+// 「最初の報」になり、届いているグループにも全報が流れます。
+func TestLineCountsAReportAsSentWhenSomeGroupGotIt(t *testing.T) {
+	var mu sync.Mutex
+	recorder := &lineRecorder{}
+	l := recorder.sink(t, func(int, http.ResponseWriter) {})
+	l.groups = &fakeLineGroups{active: []string{testLineGroup, testLineGroup2}}
+	// testLineGroup2 は退出済みで、毎回 400 になります。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		mu.Lock()
+		recorder.requests = append(recorder.requests, lineRequest{text: string(body)})
+		mu.Unlock()
+		if strings.Contains(string(body), testLineGroup2) {
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	l.endpoint = server.URL
+
+	l.deliver(context.Background(), eewEvent(t, "1", scale5Upper, false, false))
+	l.deliver(context.Background(), eewEvent(t, "2", scale5Upper, false, false))
+
+	if got := len(recorder.requests); got != 2 {
+		t.Errorf("made %d requests, want 2: the second report must be held back because a group got the first", got)
 	}
 }
 
@@ -425,5 +469,34 @@ func TestReadLineCredentials(t *testing.T) {
 
 	if _, err := readLineCredentials(context.Background(), resolver, "/token", "", "/test"); err == nil {
 		t.Error("a LINE without a group table was accepted")
+	}
+}
+
+// 本番の上流以外へ繋いでいる時は、LINE をテスト用グループだけにします。
+// サンドボックスの URL は末尾のスラッシュやクエリで表記が揺れるので、
+// 「サンドボックスなら」ではなく「本番でなければ」で判定します。
+func TestLineIsTestOnlyUnlessConnectedToProduction(t *testing.T) {
+	cases := map[string]bool{
+		"":                           false, // 既定値 = 本番
+		defaultWebSocketURL:          false,
+		sandboxWebSocketURL:          true,
+		sandboxWebSocketURL + "/":    true,
+		sandboxWebSocketURL + "?x=1": true,
+		"ws://127.0.0.1:8080/v2/ws":  true,
+	}
+	for url, wantTestOnly := range cases {
+		t.Setenv("P2PQUAKE_WS_URL", url)
+		t.Setenv("P2PQUAKE_DEV_WEBHOOK_PARAMETER_NAME", "/dev")
+		t.Setenv("P2PQUAKE_LINE_TOKEN_PARAMETER_NAME", "/token")
+		t.Setenv("P2PQUAKE_LINE_GROUPS_TABLE", "table")
+		resolver := mapResolver{"/dev": "https://discord.com/api/webhooks/1/x", "/token": "abc"}
+
+		cfg, err := loadConfig(context.Background(), resolver)
+		if err != nil {
+			t.Fatalf("%q: %v", url, err)
+		}
+		if cfg.Line == nil || cfg.Line.TestOnly != wantTestOnly {
+			t.Errorf("%q: line = %+v, want TestOnly=%t", url, cfg.Line, wantTestOnly)
+		}
 	}
 }
